@@ -3,6 +3,7 @@ from datetime import datetime
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
@@ -345,7 +346,6 @@ if run_audit:
       ]
       base_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
 
-      # Risk Overlays Calculations
       eps_rev_pct = eg_val if eg_val < -0.05 else 0.0
       bookings_delta = eg_val - rg_val
       val_cap_flag = (
@@ -377,7 +377,7 @@ if run_audit:
       target_buy_price = fair_value * (1 - mos_input)
 
   else:
-    # --- PRE-PROFIT STARTUP / VENTURE LENS (EXPANDED PARAMETERS) ---
+    # --- PRE-PROFIT STARTUP / VENTURE LENS ---
     company_name = startup_name
     curr_sym = "$"
 
@@ -397,7 +397,6 @@ if run_audit:
           " economic hurdles."
       )
 
-    # Expanded Startup Parameter Scoring
     s11 = 5 if gross_margin_input >= 0.75 else (4 if gross_margin_input >= 0.60 else 2)
     s12 = 5 if rev_growth_input >= 1.0 else (4 if rev_growth_input >= 0.50 else 2)
     s13 = 5 if burn_multiple_input <= 1.2 else (3 if burn_multiple_input <= 2.0 else 1)
@@ -502,7 +501,35 @@ if run_audit:
   else:
     st.success("✅ **Clean Audit:** No critical structural red flags triggered.")
 
-  # Pillar Breakdown Table
+  # --- INTERACTIVE PLOTLY VISUALIZATION ---
+  st.markdown("### 📊 Visual Score Breakdown")
+  df_chart = pd.DataFrame(
+      [
+          {
+              "Ref": r[0],
+              "Category": r[1],
+              "Criteria": r[2],
+              "Score": r[5],
+              "Metric": r[4],
+          }
+          for r in rows
+      ]
+  )
+  fig = px.bar(
+      df_chart,
+      x="Score",
+      y="Criteria",
+      orientation="h",
+      color="Score",
+      color_continuous_scale="Teal",
+      range_x=[0, 5],
+      text="Metric",
+      title="Pillar Score Distribution (Scale 1 to 5)",
+  )
+  fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=400)
+  st.plotly_chart(fig, use_container_width=True)
+
+  # Detailed Pillar Scorecard Table
   st.markdown("### Detailed Pillar Scorecard")
   df_display = pd.DataFrame(
       [
@@ -519,6 +546,16 @@ if run_audit:
       ]
   )
   st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+  # --- EDUCATIONAL REFERENCES & EXPLANATIONS ---
+  with st.expander("📚 Educational Reference & Glossary for Key Metrics"):
+    st.markdown("""
+        To learn more about how these financial concepts are evaluated in institutional analysis, explore these references:
+        * **[Investopedia: Margin of Safety](https://www.investopedia.com/terms/m/marginofsafety.asp)** — Explains the principle of purchasing assets below their intrinsic fair value to mitigate downside risk.
+        * **[Bessemer Venture Partners: Burn Multiple](https://www.bvp.com/atlas/the-burn-multiple)** — A premier metric for evaluating how efficiently a pre-profit startup turns capital burn into net new Annual Recurring Revenue (ARR).
+        * **[Corporate Finance Institute: Debt-to-Equity Ratio](https://corporatefinanceinstitute.com/resources/commercial-lending/debt-to-equity-ratio/)** — Measures financial leverage and long-term solvency risk.
+        * **[Sifted: Net Revenue Retention (NRR)](https://sifted.eu/)** — Analyzes customer expansion and product stickiness over time.
+        """)
 
 else:
   st.info(
