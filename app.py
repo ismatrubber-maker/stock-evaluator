@@ -9,6 +9,14 @@ Two lenses
   1. Public Equity Screen - 15 independent pillars for profitable listed companies (US and India).
   2. Venture Lens         - 6 pillars plus a cash-runway / breakeven model for pre-profit companies.
 
+Version 2 adds an optional macro overlay. Every part of it is OFF by default, so out of the box the
+scores, labels, gates and forward valuation are exactly those of version 1:
+  * Rate links     - tie the required return to the 10-year yield, and the exit-multiple floor to rates.
+  * Stress tests   - information only: interest cover if rates rise, debt due within a year, earnings
+                     cyclicality, gross-margin pricing power, and a regulation flag that you set yourself.
+  * Macro backdrop - US and India market readings (rates, inflation, volatility, trend), side by side.
+Nothing macro-related changes a pillar weight or a pillar score.
+
 Design rules
   * Nothing is invented. A metric that cannot be sourced shows "n/a", is left out of the score and
     the remaining weights are rescaled. Data coverage is shown next to every score.
@@ -20,6 +28,7 @@ Design rules
 from __future__ import annotations
 
 import math
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -52,8 +61,30 @@ PROJECTION_GROWTH_CAP = 1.5    # starting growth used in the venture projection 
 DEFAULT_FADE = 0.80
 DEFAULT_COST_RATIO = 0.60
 
+# Macro overlay (version 2). All of it is optional and off by default.
+APP_VERSION = "2.0 (macro options)"
+MACRO_TTL = 3 * 60 * 60        # seconds fetched macro data stays cached
+HTTP_TIMEOUT = 10              # seconds to wait for FRED before giving up on it
+REQ_RETURN_MIN = 0.08          # a rate-linked required return is held inside this band
+REQ_RETURN_MAX = 0.15
+FLOOR_PE_MIN = 10.0            # a rate-linked exit-multiple floor is held inside this band
+FLOOR_PE_MAX = 25.0
+DEFAULT_ERP = 0.055            # equity risk premium added to the 10-year yield (published estimates run about 4% to 6%)
+DEFAULT_G_US = 0.03            # long-run growth used for the floor: US-dollar stocks
+DEFAULT_G_IN = 0.05            # same for Indian stocks (higher inflation, so higher nominal growth)
+DEFAULT_SHOCK = 0.02           # rate rise used by the interest-cover stress test (2 percentage points)
+COVER_RISK, COVER_WATCH = 1.5, 3.0            # same cut-offs as the interest-coverage safety gates
+CYC_DROP_WATCH, CYC_DROP_RISK = -0.15, -0.30  # worst year-over-year fall in operating income
+CYC_RANGE_WATCH, CYC_RANGE_RISK = 0.04, 0.08  # spread between the best and worst operating margin
+CAUTION_VIX = {"US": 25.0, "IN": 20.0}        # volatility-index levels usually read as elevated
+CAUTION_CPI = {"US": 0.04, "IN": 0.06}        # inflation levels treated as high
+CAUTION_DRAWDOWN = -0.10       # an index 10% or more below its 52-week high
+CAUTION_UNEMP_RISE = 0.5       # unemployment up half a point or more from its 12-month low
+REG_LEVELS = ["Not assessed", "Low", "Moderate", "High"]
+
 MODE_PUBLIC = "Public equity screen (profitable companies)"
 MODE_VENTURE = "Pre-profit / venture lens"
+MODE_MACRO = "Macro backdrop (US and India)"
 SRC_MANUAL = "Manual inputs"
 SRC_TICKER = "Public ticker (auto-fetch)"
 LOSS_AUTO = "Auto: growth companies go to the venture lens"
@@ -479,6 +510,212 @@ def extract_public_metrics(snap):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3b. MACRO DATA LAYER  (optional: a failed fetch can never change a stock's score)
+# ══════════════════════════════════════════════════════════════════════════════
+def fred_start():
+    """Start date for FRED requests: 1 January two years back, so the cache key stays stable all year."""
+    return f"{datetime.now(timezone.utc).year - 2}-01-01"
+
+
+def parse_fred_csv(text):
+    """FRED graph CSV -> [(date, value)], oldest first. Columns are read by position (FRED has renamed its header
+    before) and '.' marks a missing observation. A line that is not 'date,number' is skipped, so an HTML error page
+    gives an empty list rather than nonsense."""
+    rows = []
+    for i, line in enumerate((text or "").splitlines()):
+        parts = line.split(",")
+        if i == 0 or len(parts) < 2:
+            continue
+        d, v = parts[0].strip(), num(parts[1].strip())
+        if v is not None and len(d) == 10 and d[4] == "-" and d[7] == "-":
+            rows.append((d, v))
+    return rows
+
+
+@st.cache_data(ttl=MACRO_TTL, max_entries=32, show_spinner=False)
+def fetch_fred(series_id: str, start: str) -> list:
+    """One FRED series as [(date, value)]. Raises (and so is not cached) when FRED cannot be reached."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; stock-screener)"})
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    rows = parse_fred_csv(text)
+    if not rows:
+        raise DataError(f"FRED returned no usable data for {series_id}.")
+    return rows
+
+
+@st.cache_data(ttl=MACRO_TTL, max_entries=16, show_spinner=False)
+def fetch_market_close(symbol: str, period: str) -> list:
+    """Daily closes of a Yahoo symbol (an index, a volatility index or a yield) as [(date, close)]."""
+    hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+    if not isinstance(hist, pd.DataFrame) or hist.empty or "Close" not in hist.columns:
+        raise DataError(f"Yahoo returned no price history for {symbol}.")
+    closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    pts = [(pd.Timestamp(idx).strftime("%Y-%m-%d"), float(v)) for idx, v in closes.items() if math.isfinite(v)]
+    if not pts:
+        raise DataError(f"Yahoo returned no usable closes for {symbol}.")
+    return pts
+
+
+def yield_reading(sym, fred_id, get_mkt, get_fred, errors):
+    """Latest yield in percent -> (value, as_of, source), or None. Yahoo first, FRED as the backup."""
+    attempts = (
+        (f"Yahoo {sym}", lambda: get_mkt(sym, "1mo")),
+        (f"FRED {fred_id}", lambda: get_fred(fred_id, fred_start())),
+    )
+    for source, fetch in attempts:
+        try:
+            as_of, v = fetch()[-1]
+        except Exception as exc:  # noqa: BLE001 - any network or parsing problem just moves on to the next source
+            errors.append(f"{source}: {type(exc).__name__}")
+            continue
+        if 0 < v < 25:
+            return v, as_of, source
+        errors.append(f"{source}: implausible yield")
+    return None
+
+
+def trend_stats(pts):
+    """[(date, close)] oldest first -> last close, its date, gap to the 200-day average and to the 52-week high."""
+    if not pts:
+        return None
+    closes = [v for _, v in pts]
+    last = closes[-1]
+    ma200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
+    high = max(closes[-252:])
+    return {"last": last, "as_of": pts[-1][0],
+            "vs_ma200": (last / ma200 - 1) if ma200 else None,
+            "drawdown": (last / high - 1) if high > 0 else None}
+
+
+def yoy_change(rows):
+    """Monthly [(date, value)] -> (date, change over the same month a year earlier), or None."""
+    if not rows:
+        return None
+    d1, v1 = rows[-1]
+    prior = dict(rows).get(f"{int(d1[:4]) - 1}{d1[4:]}")
+    return (d1, v1 / prior - 1) if prior and prior > 0 else None
+
+
+def rise_from_low(rows, window=12):
+    """[(date, value)] -> (date, latest value minus the lowest of the last `window` readings), or None."""
+    if len(rows) < 3:
+        return None
+    return rows[-1][0], rows[-1][1] - min(v for _, v in rows[-window:])
+
+
+def _pct1(v):
+    return f"{v:.1f}%"
+
+
+def _pct2(v):
+    return f"{v:.2f}%"
+
+
+def _gap(v):
+    """Gap to a high, shown as a plain negative number (0.0% when at the high, never '-0.0%')."""
+    return f"{round(v, 1) + 0.0:.1f}%"
+
+
+def macro_row(key, label, value, disp, as_of="", source="", rule="", signal=None):
+    """One line of the macro panel. signal: True = caution active, False = not, None = not a signal or no data."""
+    return {"key": key, "label": label, "value": value, "disp": disp, "as_of": as_of, "source": source,
+            "rule": rule, "signal": signal}
+
+
+def add_reading(rows, key, label, reading, fmt, rule="", signal=None, missing="n/a"):
+    """reading = (value, as_of, source) or None."""
+    if reading is None:
+        rows.append(macro_row(key, label, None, missing))
+        return
+    v, as_of, source = reading
+    rows.append(macro_row(key, label, v, fmt(v), as_of, source, rule, signal(v) if signal else None))
+
+
+def collect_macro(mc, get_mkt=None, get_fred=None):
+    """US and India readings -> {"us": [rows], "in": [rows], "y10": {"US": fraction or None, "IN": ...},
+    "errors": [...], "fetched_at": text}. Each indicator is fetched on its own, so one failure leaves the rest."""
+    get_mkt = get_mkt or fetch_market_close
+    get_fred = get_fred or fetch_fred
+    errors, start = [], fred_start()
+
+    def fetch(fn, *args):
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001 - one failed indicator must not hide the others
+            errors.append(f"{args[0]}: {type(exc).__name__}")
+            return None
+
+    def latest_of(rows, source):
+        return (rows[-1][1], rows[-1][0], source) if rows else None
+
+    def index_rows(out, key, name, symbol):
+        ts = trend_stats(fetch(get_mkt, symbol, "1y"))
+        source = f"Yahoo {symbol}"
+        ma = None if ts is None or ts["vs_ma200"] is None else (ts["vs_ma200"] * 100, ts["as_of"], source)
+        add_reading(out, key + "_ma", f"{name} vs its 200-day average", ma, lambda v: f"{v:+.1f}%",
+                    "below the 200-day average", lambda v: v < 0)
+        dd = None if ts is None or ts["drawdown"] is None else (ts["drawdown"] * 100, ts["as_of"], source)
+        add_reading(out, key + "_dd", f"{name} vs its 52-week high", dd, _gap,
+                    f"{abs(CAUTION_DRAWDOWN) * 100:.0f}% or more below the high", lambda v: v <= CAUTION_DRAWDOWN * 100)
+
+    # United States ------------------------------------------------------------------------------
+    us = []
+    override = mc.get("us_y10")
+    y10 = (override * 100, "", "entered by you") if override else yield_reading("^TNX", "DGS10", get_mkt, get_fred, errors)
+    y3m = yield_reading("^IRX", "DTB3", get_mkt, get_fred, errors)
+    add_reading(us, "y10", "10-year Treasury yield", y10, _pct2)
+    add_reading(us, "y3m", "3-month Treasury bill yield", y3m, _pct2)
+    curve = (y10[0] - y3m[0], max(y10[1], y3m[1]), "calculated") if (y10 and y3m) else None
+    add_reading(us, "curve", "Yield curve (10-year minus 3-month)", curve, lambda v: f"{v:+.2f} pts",
+                "10-year below 3-month (inverted)", lambda v: v < 0)
+    add_reading(us, "ff", "Fed funds rate (effective)", latest_of(fetch(get_fred, "DFF", start), "FRED DFF"), _pct2)
+    yoy = yoy_change(fetch(get_fred, "CPIAUCSL", start) or [])
+    cpi = (yoy[1] * 100, yoy[0], "FRED CPIAUCSL") if yoy else None
+    add_reading(us, "cpi", "Consumer price inflation (year on year)", cpi, _pct1,
+                f"at or above {CAUTION_CPI['US'] * 100:.0f}%", lambda v: v >= CAUTION_CPI["US"] * 100)
+    real = (y10[0] - cpi[0], cpi[1], "calculated") if (y10 and cpi) else None
+    add_reading(us, "real", "10-year yield minus latest inflation (crude real yield)", real, lambda v: f"{v:+.2f} pts")
+    unemp = fetch(get_fred, "UNRATE", start) or []
+    rise = rise_from_low(unemp)
+    if rise is None:
+        add_reading(us, "unemp", "Unemployment rate", None, _pct1)
+    else:
+        us.append(macro_row("unemp", "Unemployment rate", rise[1],
+                            f"{unemp[-1][1]:.1f}% ({rise[1]:+.1f} pts vs its 12-month low)", rise[0], "FRED UNRATE",
+                            f"up {CAUTION_UNEMP_RISE:.1f} pts or more from the 12-month low",
+                            rise[1] >= CAUTION_UNEMP_RISE))
+    add_reading(us, "vix", "VIX (US equity volatility)", latest_of(fetch(get_mkt, "^VIX", "1y"), "Yahoo ^VIX"),
+                lambda v: f"{v:.1f}", f"at or above {CAUTION_VIX['US']:.0f}", lambda v: v >= CAUTION_VIX["US"])
+    index_rows(us, "spx", "S&P 500", "^GSPC")
+
+    # India: market data is automatic, policy rate / yield / inflation are typed in -----------------------
+    ind = []
+    index_rows(ind, "nifty", "Nifty 50", "^NSEI")
+    add_reading(ind, "ivix", "India VIX (equity volatility)",
+                latest_of(fetch(get_mkt, "^INDIAVIX", "1y"), "Yahoo ^INDIAVIX"), lambda v: f"{v:.1f}",
+                f"at or above {CAUTION_VIX['IN']:.0f}", lambda v: v >= CAUTION_VIX["IN"])
+
+    def typed(key):
+        return None if mc.get(key) is None else (mc[key] * 100, "", "entered by you")
+
+    repo, g10, cpi_in = typed("in_repo"), typed("in_y10"), typed("in_cpi")
+    add_reading(ind, "repo", "RBI repo rate", repo, _pct2, missing="not entered")
+    add_reading(ind, "g10", "India 10-year government bond yield", g10, _pct2, missing="not entered")
+    add_reading(ind, "cpi", "Consumer price inflation (latest, year on year)", cpi_in, _pct1,
+                f"at or above {CAUTION_CPI['IN'] * 100:.0f}%", lambda v: v >= CAUTION_CPI["IN"] * 100,
+                missing="not entered")
+    real_in = (g10[0] - cpi_in[0], "", "calculated") if (g10 and cpi_in) else None
+    add_reading(ind, "real", "10-year yield minus latest inflation (crude real yield)", real_in,
+                lambda v: f"{v:+.2f} pts", missing="needs the two inputs above")
+
+    return {"us": us, "in": ind, "errors": errors,
+            "y10": {"US": y10[0] / 100 if y10 else None, "IN": mc.get("in_y10")},
+            "fetched_at": datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 4. SCORING MODEL (shared by both lenses)
 # ══════════════════════════════════════════════════════════════════════════════
 @dataclass
@@ -639,7 +876,8 @@ def forward_model(m, cfg):
     Growth = conservative multi-year growth, capped. Exit P/E = lower of today's P/E and the
     PEG-implied P/E, so the multiple can stay flat or shrink but never expands. Fair value = year-2
     price discounted at the required return. The entry price adds a margin of safety. Analyst targets
-    are never used.
+    are never used. The required return is cfg["req_return"] and the exit-multiple floor is cfg["min_pe"]
+    when present (else MIN_PE): that is how the optional rate links reach the model.
     """
     if m["currency_mismatch"]:
         return None, ("Prices are quoted in one currency and financials reported in another (typical for ADRs), "
@@ -655,7 +893,8 @@ def forward_model(m, cfg):
     else:
         return None, "No growth history is available, so no forward valuation is produced."
     g = min(max(g_raw, 0.0), cfg["max_growth"])
-    pe_peg = min(cfg["max_pe"], max(MIN_PE, cfg["target_peg"] * g * 100))
+    floor = cfg.get("min_pe", MIN_PE)  # the fixed 15x unless the optional rate link has replaced it
+    pe_peg = min(cfg["max_pe"], max(floor, cfg["target_peg"] * g * 100))
     mult = min(m["pe_ttm"], pe_peg) if m["pe_ttm"] else pe_peg
     eps1 = eps0 * (1 + g)
     eps2 = eps1 * (1 + g * EPS_GROWTH_FADE)
@@ -664,13 +903,281 @@ def forward_model(m, cfg):
     entry = fair * (1 - cfg["mos"])
     ni0 = m["ni_ttm"]
     return {
-        "g_raw": g_raw, "g": g, "pe_peg": pe_peg, "mult": mult,
+        "g_raw": g_raw, "g": g, "pe_peg": pe_peg, "mult": mult, "min_pe": floor, "req_return": cfg["req_return"],
         "eps": [eps0, eps1, eps2],
         "ni": [ni0, ni0 * eps1 / eps0 if ni0 is not None else None, ni0 * eps2 / eps0 if ni0 is not None else None],
         "prices": [price, p1, p2],
         "fair": fair, "entry": entry,
         "implied": (p2 / price) ** 0.5 - 1,
     }, ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5b. RATE LINKS AND STRESS TESTS  (version 2, optional; none of this touches a pillar score)
+# ══════════════════════════════════════════════════════════════════════════════
+def fmt_rate(v):
+    """0.0985 -> '9.85%'. A whole rate such as 0.10 prints as '10%'."""
+    text = f"{v * 100:.2f}".rstrip("0").rstrip(".")
+    return text + "%"
+
+
+def default_rates(cfg):
+    """The fixed assumptions, untouched. Every stock gets exactly this unless a rate link is switched on."""
+    return {"req_return": cfg["req_return"], "min_pe": MIN_PE, "r_linked": False, "floor_linked": False,
+            "market": None, "y10": None, "r_implied": None, "g_lt": None, "lines": [], "notes": []}
+
+
+def market_for(m):
+    """Which rate curve applies to a stock, judged from its trading currency: 'US', 'IN' or None."""
+    cur = (m.get("currency") or "").upper()
+    if cur == "USD":
+        return "US"
+    if cur == "INR" or (not cur and str(m.get("ticker") or "").upper().endswith((".NS", ".BO"))):
+        return "IN"
+    return None
+
+
+def linked_required_return(y10, erp):
+    """10-year government yield plus the equity risk premium, held between REQ_RETURN_MIN and REQ_RETURN_MAX."""
+    return min(max(y10 + erp, REQ_RETURN_MIN), REQ_RETURN_MAX)
+
+
+def linked_floor(r, g_lt):
+    """P/E that a business with no growth premium would justify: 1 / (required return - long-run growth),
+    held between FLOOR_PE_MIN and FLOOR_PE_MAX."""
+    spread = r - g_lt
+    if spread <= 0:
+        return FLOOR_PE_MAX
+    return min(max(1.0 / spread, FLOOR_PE_MIN), FLOOR_PE_MAX)
+
+
+def us_10y(mc, get_mkt=None, get_fred=None):
+    """US 10-year yield as a fraction -> (value or None, source text). A typed override wins over live data."""
+    if mc.get("us_y10"):
+        return mc["us_y10"], "entered by you"
+    errors = []
+    found = yield_reading("^TNX", "DGS10", get_mkt or fetch_market_close, get_fred or fetch_fred, errors)
+    if found is None:
+        return None, "; ".join(errors) or "no data"
+    v, as_of, source = found
+    return v / 100, f"{source}, {as_of}"
+
+
+def resolve_rates(m, cfg, get_mkt=None, get_fred=None):
+    """Which required return and exit-multiple floor the forward model should use for this stock.
+
+    With both links off (the default) this returns the sidebar's fixed values and fetches nothing. A link that
+    cannot be applied (unsupported currency, no yield available) falls back to the fixed values and says why.
+    """
+    out = default_rates(cfg)
+    want_r, want_f = bool(cfg.get("link_r")), bool(cfg.get("link_floor"))
+    if not (want_r or want_f):
+        return out
+    mc = cfg.get("macro") or {}
+    market = market_for(m)
+    if market is None:
+        out["notes"].append(
+            f"The rate links cover US-dollar and Indian-rupee stocks. This one trades in {m.get('currency') or 'an unknown currency'}, "
+            "so the fixed assumptions are used.")
+        return out
+    if market == "US":
+        y10, source = us_10y(mc, get_mkt, get_fred)
+    else:
+        y10, source = mc.get("in_y10"), "entered by you"
+    if y10 is None:
+        if market == "US":
+            out["notes"].append(f"No US 10-year yield could be loaded ({source}). Type one in under Macro overlay in the "
+                                "sidebar; until then the fixed assumptions are used.")
+        else:
+            out["notes"].append("No India 10-year yield has been entered under Macro overlay in the sidebar, so the "
+                                "fixed assumptions are used.")
+        return out
+    erp = mc.get("erp", DEFAULT_ERP)
+    raw_r = y10 + erp
+    r_imp = linked_required_return(y10, erp)
+    name = "US" if market == "US" else "India"
+    out.update(market=market, y10=y10, r_implied=r_imp)
+    if want_r:
+        out.update(req_return=r_imp, r_linked=True)
+        line = f"Required return: {name} 10-year yield {y10 * 100:.2f}% ({source}) + {erp * 100:.1f}% equity risk premium = {fmt_rate(raw_r)}"
+        if abs(raw_r - r_imp) > 1e-12:
+            line += f", outside the {fmt_rate(REQ_RETURN_MIN)} to {fmt_rate(REQ_RETURN_MAX)} band, so {fmt_rate(r_imp)} is used"
+        out["lines"].append(line + ".")
+    if want_f:
+        g_lt = mc.get("g_us" if market == "US" else "g_in", DEFAULT_G_US if market == "US" else DEFAULT_G_IN)
+        floor = linked_floor(r_imp, g_lt)
+        raw_f = 1.0 / (r_imp - g_lt) if r_imp > g_lt else None
+        out.update(min_pe=floor, floor_linked=True, g_lt=g_lt)
+        shown = "no positive spread" if raw_f is None else f"{raw_f:.1f}x"
+        line = f"Exit-multiple floor: 1 / ({fmt_rate(r_imp)} - {g_lt * 100:.1f}% long-run growth) = {shown}"
+        if raw_f is None or abs(raw_f - floor) > 1e-9:
+            line += f", outside the {FLOOR_PE_MIN:.0f}x to {FLOOR_PE_MAX:.0f}x band, so {floor:.1f}x is used"
+        out["lines"].append(line + f", replacing the fixed {MIN_PE:.0f}x.")
+    return out
+
+
+def rate_sensitivity(m, fcfg, rates, steps=(-0.02, -0.01, 0.0, 0.01, 0.02)):
+    """Fair value and entry price if rates were `step` higher or lower. The step moves the required return one for
+    one, and the exit-multiple floor too when that floor is rate-linked."""
+    out = []
+    for d in steps:
+        r = fcfg["req_return"] + d
+        if r < 0.02:
+            continue
+        floor = fcfg.get("min_pe", MIN_PE)
+        if rates.get("floor_linked"):
+            floor = linked_floor(rates["r_implied"] + d, rates["g_lt"])
+        fwd, _ = forward_model(m, {**fcfg, "req_return": r, "min_pe": floor})
+        if fwd:
+            out.append({"d": d, "r": r, "floor": floor, "fair": fwd["fair"], "entry": fwd["entry"]})
+    return out
+
+
+def stress_inputs(snap, m):
+    """Extra figures the stress tests need from the annual statements. Missing -> None, never a default."""
+    inc, bal, cf = snap["income"], snap["balance"], snap["cashflow"]
+    rev_pts = stmt_series(inc, "Total Revenue", "Operating Revenue")
+    ebit_pts = stmt_series(inc, "EBIT", "Operating Income")
+    int_pts = stmt_series(inc, "Interest Expense", "Interest Expense Non Operating")
+    gm_pts = margin_series(stmt_series(inc, "Gross Profit"), rev_pts)
+    fcf_pts = fcf_series(cf)
+    return {
+        "ebit": ebit_pts[-1][1] if ebit_pts else None,
+        "interest": abs(int_pts[-1][1]) if int_pts else None,
+        "debt": coalesce(latest(bal, "Total Debt"), m["total_debt"]),
+        "debt_due": coalesce(latest(bal, "Current Debt And Capital Lease Obligation"), latest(bal, "Current Debt")),
+        "cash": coalesce(latest(bal, "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"),
+                         m["cash"]),
+        "fcf": fcf_pts[-1][1] if fcf_pts else None,
+        "ebit_series": ebit_pts[-4:],
+        "margin_series": margin_series(ebit_pts, rev_pts)[-4:],
+        "gm_n": len(gm_pts),
+    }
+
+
+def stress_row(name, status, reading, detail):
+    return {"name": name, "status": status, "reading": reading, "detail": detail}
+
+
+def cover_status(c):
+    return "risk" if c < COVER_RISK else "watch" if c < COVER_WATCH else "ok"
+
+
+def stress_tests(m, si, shock, reg_level="Not assessed", reg_note=""):
+    """Information-only tests of how a business copes with higher rates, a debt wall, a downturn and inflation.
+    They never touch the score, the label or the safety gates. -> list of {name, status, reading, detail};
+    status is ok / watch / risk / na."""
+    fs = m["fin_sym"]
+    si = si or {}
+    rows = []
+    ebit, interest, debt, due = si.get("ebit"), si.get("interest"), si.get("debt"), si.get("debt_due")
+    if due is not None and debt is not None:
+        due = min(max(due, 0.0), debt)
+
+    # 1. Interest cover if rates rise ------------------------------------------------------------------
+    name = f"Interest cover if rates rise {shock * 100:.1f} pts"
+    how = ("Extra interest = the rate rise x the debt that reprices. The 'refinanced' case covers only debt due within "
+           "a year. The 'all debt' case is an upper bound, because fixed-rate bonds do not reprice and Yahoo does not "
+           "split fixed from floating debt. Uses the latest annual EBIT and interest expense, like pillar 2.3. Cut-offs "
+           f"match the coverage gates: under {COVER_WATCH:.0f}x is watch, under {COVER_RISK:.1f}x is risk.")
+    if debt is not None and debt <= 0:
+        rows.append(stress_row(name, "ok", "No debt", "No borrowings on the latest balance sheet, so higher rates do "
+                                                      "not raise interest costs directly."))
+    elif ebit is None or not interest or debt is None:
+        rows.append(stress_row(name, "na", "n/a", "Needs EBIT, interest expense and total debt from the latest annual filing."))
+    else:
+        base = ebit / interest
+        cover_all = ebit / (interest + shock * debt)
+        if due is not None:
+            cover_due = ebit / (interest + shock * due)
+            status = cover_status(cover_due)
+            if status == "ok" and cover_all < COVER_RISK:
+                status = "watch"
+            reading = (f"{base:.1f}x today. {cover_due:.1f}x if the debt due within a year is refinanced at the higher "
+                       f"rate. {cover_all:.1f}x if all debt reprices.")
+        else:
+            status = cover_status(cover_all)
+            status = "watch" if status == "risk" else status
+            reading = f"{base:.1f}x today. {cover_all:.1f}x if all debt reprices (debt due within a year is not reported)."
+        rows.append(stress_row(name, status, reading, how))
+
+    # 2. Debt due within a year ------------------------------------------------------------------------
+    name = "Debt due within a year"
+    cash, fcf = si.get("cash"), si.get("fcf")
+    if due is None:
+        rows.append(stress_row(name, "na", "n/a", "The latest annual balance sheet does not report current debt."))
+    elif due <= 0:
+        rows.append(stress_row(name, "ok", "None due", "No debt falls due within a year on the latest annual balance sheet."))
+    elif cash is None:
+        rows.append(stress_row(name, "na", f"{fmt_big(due, fs)} due; cash not reported",
+                               "Needs cash and short-term investments from the latest annual balance sheet."))
+    else:
+        share = f" ({due / debt:.0%} of total debt)" if debt else ""
+        by_cash = cash / due
+        by_flow = (cash + max(fcf or 0.0, 0.0)) / due
+        status = "ok" if by_cash >= 1 else "watch" if by_flow >= 1 else "risk"
+        reading = f"{fmt_big(due, fs)} due{share}. Cash and short-term investments cover it {by_cash:.1f}x"
+        reading += f", or {by_flow:.1f}x with a year of free cash flow." if by_cash < 1 else "."
+        rows.append(stress_row(name, status, reading,
+                               "Green: cash alone covers it. Yellow: cash plus a year of free cash flow covers it. "
+                               "Red: it would need refinancing or new funding. Uses the latest annual filing."))
+
+    # 3. Earnings cyclicality --------------------------------------------------------------------------
+    name = "Earnings cyclicality"
+    es, ms = si.get("ebit_series") or [], si.get("margin_series") or []
+    detail = (f"Worst year-over-year change in operating income (watch at {CYC_DROP_WATCH * 100:.0f}% or worse, risk at "
+              f"{CYC_DROP_RISK * 100:.0f}% or worse) and the largest fall in operating margin from an earlier peak "
+              f"(watch at {CYC_RANGE_WATCH * 100:.0f} pts, risk at {CYC_RANGE_RISK * 100:.0f} pts). Rising profits never "
+              "count against a company. Annual filings only, so this is a short window and may miss a full cycle.")
+    if len(es) < 3:
+        rows.append(stress_row(name, "na", "n/a", "Needs three or more annual filings of operating income."))
+    else:
+        drops = [max(b / a - 1, -1.0) for (_, a), (_, b) in zip(es, es[1:]) if a > 0]
+        worst = min(drops) if drops else None
+        fall = None
+        if len(ms) >= 3:
+            peak, fall = ms[0][1], 0.0
+            for _, v in ms:
+                peak = max(peak, v)
+                fall = max(fall, peak - v)
+        if worst is None and fall is None:
+            rows.append(stress_row(name, "na", "n/a", "Operating income was not positive in the earlier filings, so "
+                                                      "year-over-year changes are not meaningful."))
+        else:
+            risk = (worst is not None and worst <= CYC_DROP_RISK) or (fall is not None and fall >= CYC_RANGE_RISK)
+            watch = (worst is not None and worst <= CYC_DROP_WATCH) or (fall is not None and fall >= CYC_RANGE_WATCH)
+            parts = []
+            if worst is not None:
+                parts.append(f"Worst year-over-year change in operating income {worst * 100:+.0f}%")
+            if fall is not None:
+                parts.append(f"Largest fall in operating margin from a peak {fall * 100:.1f} pts")
+            rows.append(stress_row(name, "risk" if risk else "watch" if watch else "ok",
+                                   ". ".join(parts) + f" ({len(es)} annual filings).", detail))
+
+    # 4. Pricing power ---------------------------------------------------------------------------------
+    name = "Pricing power (gross margin)"
+    gm, trend = m.get("gross_margin"), m.get("gm_trend_pp")
+    if gm is None:
+        rows.append(stress_row(name, "na", "n/a", "Needs a gross-profit line, which banks and some service companies do not report."))
+    elif trend is None:
+        rows.append(stress_row(name, "na", f"Gross margin {gm * 100:.1f}%. Trend n/a.",
+                               "Needs three or more annual filings that report gross profit."))
+    else:
+        status = "ok" if trend >= -1 else "watch" if trend >= -4 else "risk"
+        span = si.get("gm_n") or "the available"
+        rows.append(stress_row(name, status, f"Gross margin {gm * 100:.1f}%, {trend:+.1f} pts across {span} annual filings.",
+                               "A company that can pass on higher costs keeps its gross margin when inflation rises. "
+                               "Same cut-offs as pillar 1.2: a change of -1 pt or better is fine, worse than -4 pts is a weak spot."))
+
+    # 5. Regulation and policy: entered by you, never scored ------------------------------------------------
+    name = "Regulation and policy (your view)"
+    level = reg_level if reg_level in ("Low", "Moderate", "High") else "Not assessed"
+    note = (reg_note or "").strip()
+    rows.append(stress_row(name, {"Low": "ok", "Moderate": "watch", "High": "risk"}.get(level, "na"),
+                           level + (f": {note}" if note else "."),
+                           "You set this in the sidebar. The app cannot read new laws or rulings, so it does not score "
+                           "regulation. Check filings and news for the company's sector and countries."))
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -951,12 +1458,24 @@ def raw_inputs_table(m):
     return pd.DataFrame(items, columns=["Input", "Value"])
 
 
-def show_forward(m, fwd, msg, cfg):
+def show_forward(m, fwd, msg, cfg, rates=None, fixed=None):
     if fwd is None:
         say("info", msg)
         return
     s, fs = m["sym"], m["fin_sym"]
+    floor = cfg.get("min_pe", MIN_PE)
+    floor_txt = f"{floor:.0f}" if floor == MIN_PE else f"{floor:.1f}"
     st.caption("Illustrative model, not a forecast. Every assumption is listed below and can be changed in the sidebar.")
+    if rates is not None:  # a rate link that fell back to the fixed values is never silent
+        for note in rates["notes"]:
+            say("warning", note)
+        for line in rates["lines"]:
+            st.caption(esc(line))
+    if fixed is not None:
+        st.caption(esc(
+            f"For comparison, the fixed assumptions ({fmt_rate(fixed['req_return'])} required return, {fixed['min_pe']:.0f}x floor) "
+            f"would give a fair value of {fmt_price(fixed['fair'], s)} and a max entry price of {fmt_price(fixed['entry'], s)}."
+        ))
     df = pd.DataFrame({
         "Period": ["Today (TTM)", "Year 1", "Year 2"],
         "EPS": [fmt_price(x, s) for x in fwd["eps"]],
@@ -974,9 +1493,9 @@ def show_forward(m, fwd, msg, cfg):
     st.caption(esc(
         f"Growth used: {fwd['g'] * 100:.1f}% (basis: {cfg['growth_basis'].split(':')[0].lower()}; raw {fwd['g_raw'] * 100:.1f}%, "
         f"floored at 0 and capped at {cfg['max_growth'] * 100:.0f}%). Year-2 growth fades to {EPS_GROWTH_FADE:.0%} of that. "
-        f"Exit P/E = lower of today's P/E and the PEG-implied P/E ({cfg['target_peg']:.1f} x growth, between {MIN_PE:.0f} "
+        f"Exit P/E = lower of today's P/E and the PEG-implied P/E ({cfg['target_peg']:.1f} x growth, between {floor_txt} "
         f"and {cfg['max_pe']:.0f}), so the multiple can stay flat or shrink but never expands. Fair value discounts "
-        f"the year-2 price at {cfg['req_return'] * 100:.0f}% a year; the margin of safety is {cfg['mos'] * 100:.0f}%. "
+        f"the year-2 price at {fmt_rate(cfg['req_return'])} a year; the margin of safety is {cfg['mos'] * 100:.0f}%. "
         "Because growth is capped and the multiple cannot expand, high-multiple growth stocks will usually sit above "
         "the entry price. Read it as what you would have to believe, not as a price target."
     ))
@@ -987,6 +1506,84 @@ def show_forward(m, fwd, msg, cfg):
     fig = px.bar(bars, x="Item", y="Value", text=bars["Value"].map(lambda v: f"{v:,.2f}"), title="Price vs model values")
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig)
+    if rates is not None:
+        show_rate_sensitivity(m, cfg, rates)
+
+
+def show_rate_sensitivity(m, fcfg, rates):
+    rows = rate_sensitivity(m, fcfg, rates)
+    base = next((r for r in rows if r["d"] == 0), None)
+    if base is None or len(rows) < 3:
+        return
+    s = m["sym"]
+    with st.expander("Sensitivity to interest rates"):
+        st.caption(esc(
+            "What the model's fair value would be if rates were higher or lower than assumed. Each step moves the "
+            "required return one for one" + (", and the exit-multiple floor with it." if rates["floor_linked"]
+                                              else " (the exit-multiple floor stays fixed because it is not rate-linked).")
+        ))
+        df = pd.DataFrame({
+            "Rates vs the model": ["As modelled" if r["d"] == 0 else f"{r['d'] * 100:+.0f} pt" for r in rows],
+            "Required return": [fmt_rate(r["r"]) for r in rows],
+            "Exit-multiple floor": [f"{r['floor']:.1f}x" for r in rows],
+            "Fair value today": [fmt_price(r["fair"], s) for r in rows],
+            "Max entry price": [fmt_price(r["entry"], s) for r in rows],
+            "Fair value vs modelled": [f"{(r['fair'] / base['fair'] - 1) * 100:+.1f}%" for r in rows],
+        })
+        st.dataframe(df, hide_index=True)
+
+
+STATUS_ICON = {"ok": "🟢", "watch": "🟡", "risk": "🔴", "na": "⚪"}
+
+
+def show_stress(rows):
+    st.caption("Information only. These tests do not change the score, the label or the safety gates. "
+               "Green is comfortable, yellow is worth a look, red is a weak spot, white means no data. "
+               "The cut-offs are rules of thumb, not calibrated.")
+    for r in rows:
+        st.markdown(esc(f"{STATUS_ICON[r['status']]} **{r['name']}.** {r['reading']}"))
+        st.caption(esc(r["detail"]))
+
+
+def macro_dataframe(rows):
+    return pd.DataFrame([{
+        "Indicator": r["label"],
+        "Reading": r["disp"],
+        "As of": r["as_of"] or "-",
+        "Source": r["source"] or "-",
+        "Caution when": r["rule"] or "-",
+        "Caution?": "-" if r["signal"] is None else ("yes" if r["signal"] else "no"),
+    } for r in rows])
+
+
+def show_macro_market(title, rows, y10, mc, market):
+    active = sum(1 for r in rows if r["signal"] is True)
+    known = sum(1 for r in rows if r["signal"] is not None)
+    st.subheader(title)
+    st.markdown(f"**{active} of {known} caution signals active.**" if known else "**No caution signal could be read.**")
+    st.dataframe(macro_dataframe(rows), hide_index=True)
+    if y10 is not None:
+        r = linked_required_return(y10, mc["erp"])
+        g = mc["g_us"] if market == "US" else mc["g_in"]
+        st.caption(esc(
+            f"If the rate links are ticked in the screen, a stock priced in this market would use a required return of "
+            f"{fmt_rate(r)} and an exit-multiple floor of {linked_floor(r, g):.1f}x, instead of the fixed sidebar return "
+            f"and the fixed {MIN_PE:.0f}x floor."
+        ))
+
+
+def show_macro_panel(data, mc):
+    st.subheader("Macro backdrop")
+    st.caption("Descriptive readings of the market today. They are not forecasts, they do not change any score, and "
+               "the caution rules are rules of thumb, not calibrated.")
+    show_macro_market("United States", data["us"], data["y10"]["US"], mc, "US")
+    show_macro_market("India", data["in"], data["y10"]["IN"], mc, "IN")
+    if data["errors"]:
+        with st.expander("Data that could not be loaded"):
+            for err in data["errors"]:
+                st.caption(esc(err))
+    st.caption(f"Fetched {data['fetched_at']}. Yahoo Finance and FRED (St. Louis Fed) are free sources and can be delayed "
+               "or briefly unavailable. India's policy rate, bond yield and inflation are typed in by you.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1010,7 +1607,20 @@ def render_public(m, cfg):
     score, coverage, groups = summarize(pillars)
     hard, soft, flags = public_gates(m)
     kind, label, reason = decide(score, coverage, MIN_COVERAGE_PUBLIC, hard, soft)
-    fwd, fwd_msg = forward_model(m, cfg)
+    try:
+        rates = resolve_rates(m, cfg)
+    except Exception as exc:  # noqa: BLE001 - an optional feature must never stop the screen
+        rates = default_rates(cfg)
+        rates["notes"].append(f"The rate links could not be applied ({type(exc).__name__}), so the fixed assumptions are used.")
+    fcfg = {**cfg, "req_return": rates["req_return"], "min_pe": rates["min_pe"]}
+    fwd, fwd_msg = forward_model(m, fcfg)
+    fixed = forward_model(m, cfg)[0] if (rates["r_linked"] or rates["floor_linked"]) else None
+    try:
+        stress = None if m.get("stress") is None else stress_tests(
+            m, m["stress"], (cfg.get("macro") or {}).get("shock", DEFAULT_SHOCK),
+            cfg.get("reg_level", REG_LEVELS[0]), cfg.get("reg_note", ""))
+    except Exception:  # noqa: BLE001 - same rule: the stress tests are an extra, not part of the screen
+        stress = None
 
     st.subheader(f"{m['name']} ({m['ticker']})")
     st.caption(esc(
@@ -1043,12 +1653,19 @@ def render_public(m, cfg):
         col.metric(g, "n/a" if v is None else f"{v:.2f} / 5")
     show_findings(hard, soft, flags)
 
-    t1, t2, t3 = st.tabs(["Scorecard", "Forward valuation (illustrative)", "Inputs used"])
+    flagged = bool(stress) and any(r["status"] == "risk" for r in stress)
+    t1, t2, t3, t4 = st.tabs(["Scorecard", "Forward valuation (illustrative)",
+                              "Stress tests (info only)" + (" ⚠" if flagged else ""), "Inputs used"])
     with t1:
         show_scorecard(pillars, f"{m['ticker']}_scorecard.csv", "Pillar scores (1 = poor, 5 = excellent)")
     with t2:
-        show_forward(m, fwd, fwd_msg, cfg)
+        show_forward(m, fwd, fwd_msg, fcfg, rates, fixed)
     with t3:
+        if stress is None:
+            say("info", "The stress tests could not be computed from the data Yahoo returned.")
+        else:
+            show_stress(stress)
+    with t4:
         st.caption("Check these against the Yahoo Finance page or the company filings before relying on the result.")
         st.dataframe(raw_inputs_table(m), hide_index=True)
 
@@ -1142,10 +1759,40 @@ def explain_error(exc):
     return f"The analysis could not be completed. {text}"
 
 
+def macro_inputs():
+    """Sidebar inputs shared by the rate links, the stress tests and the macro panel. The boxes show percent; the
+    returned dict holds fractions (None = left blank)."""
+    frac = lambda v: None if v is None else v / 100
+    mc = {
+        "erp": st.slider("Equity risk premium (%)", 3.0, 8.0, round(DEFAULT_ERP * 100, 2), 0.25, key="m_erp",
+                         help="Added to the 10-year yield to get the required return. Published estimates run about 4% to 6%.") / 100,
+        "g_us": st.slider("Long-run growth for the floor, US-dollar stocks (%)", 1.0, 5.0, round(DEFAULT_G_US * 100, 2), 0.25,
+                          key="m_gus", help="Used only when the exit-multiple floor is rate-linked. Roughly long-run nominal growth.") / 100,
+        "g_in": st.slider("Long-run growth for the floor, Indian stocks (%)", 2.0, 8.0, round(DEFAULT_G_IN * 100, 2), 0.25,
+                          key="m_gin", help="Higher than the US figure because Indian inflation and nominal growth are higher.") / 100,
+        "shock": st.slider("Rate rise for the stress test (percentage points)", 0.5, 4.0, round(DEFAULT_SHOCK * 100, 2), 0.5,
+                           key="m_shock", help="Used by the interest-cover stress test.") / 100,
+    }
+    st.markdown("**Typed-in figures** (leave blank where not needed)")
+    mc["us_y10"] = frac(st.number_input(
+        "US 10-year yield override (%)", min_value=0.1, max_value=25.0, value=None, step=0.05, format="%.2f", key="m_us10",
+        placeholder="blank = use live data", help="Overrides the live yield, for example if the live fetch fails."))
+    mc["in_y10"] = frac(st.number_input(
+        "India 10-year government bond yield (%)", min_value=0.1, max_value=25.0, value=None, step=0.05, format="%.2f",
+        key="m_in10", placeholder="not set", help="Needed for the rate links on Indian stocks. Check the latest figure."))
+    mc["in_repo"] = frac(st.number_input(
+        "India repo rate (%)", min_value=0.0, max_value=25.0, value=None, step=0.05, format="%.2f", key="m_repo",
+        placeholder="not set", help="Shown in the macro backdrop only."))
+    mc["in_cpi"] = frac(st.number_input(
+        "India CPI inflation, latest year on year (%)", min_value=-5.0, max_value=30.0, value=None, step=0.1, format="%.1f",
+        key="m_incpi", placeholder="not set", help="Shown in the macro backdrop only."))
+    return mc
+
+
 def sidebar():
     sb = st.sidebar
     sb.header("Configuration")
-    mode = sb.radio("Evaluation mode", [MODE_PUBLIC, MODE_VENTURE])
+    mode = sb.radio("Evaluation mode", [MODE_PUBLIC, MODE_VENTURE, MODE_MACRO])
     cfg = {"mode": mode}
     if mode == MODE_PUBLIC:
         cfg["ticker"] = sb.text_input(
@@ -1165,6 +1812,29 @@ def sidebar():
             cfg["max_growth"] = st.slider("Maximum growth assumed", 0.05, 0.40, 0.20, 0.01)
             cfg["target_peg"] = st.slider("Target PEG for the exit multiple", 0.8, 2.5, 1.5, 0.1)
             cfg["max_pe"] = st.slider("Maximum exit P/E", 12.0, 45.0, 30.0, 1.0)
+        with sb.expander("Macro overlay (optional)"):
+            st.caption("Everything here is off by default. With both boxes unticked, scores and the forward valuation "
+                       "are exactly as before.")
+            cfg["link_r"] = st.checkbox(
+                "Tie the required return to the 10-year yield", value=False, key="link_r",
+                help="Required return = 10-year government yield + equity risk premium. US-dollar stocks use the US yield "
+                     "(live, or typed in below); Indian stocks use the India yield typed in below. The fixed slider "
+                     "above is the fallback when no yield is available.")
+            cfg["link_floor"] = st.checkbox(
+                "Tie the exit-multiple floor to rates", value=False, key="link_floor",
+                help=f"Replaces the fixed {MIN_PE:.0f}x floor with 1 / (required return - long-run growth), kept between "
+                     f"{FLOOR_PE_MIN:.0f}x and {FLOOR_PE_MAX:.0f}x.")
+            cfg["macro"] = macro_inputs()
+            cfg["reg_level"] = st.selectbox(
+                "Regulatory or policy exposure (your view)", REG_LEVELS, key=f"reg_level_{cfg['ticker']}",
+                help="Shown in the stress tests for this ticker. Never scored.")
+            cfg["reg_note"] = st.text_input("Regulation note (optional)", value="", max_chars=140,
+                                            key=f"reg_note_{cfg['ticker']}")
+    elif mode == MODE_MACRO:
+        sb.caption("Shows US and India readings side by side. US data loads automatically. For India, type the bond "
+                   "yield, policy rate and inflation in below.")
+        with sb.expander("Assumptions and typed-in figures", expanded=True):
+            cfg["macro"] = macro_inputs()
     else:
         cfg["source"] = sb.radio("Data source", [SRC_MANUAL, SRC_TICKER])
         if cfg["source"] == SRC_TICKER:
@@ -1187,7 +1857,7 @@ def sidebar():
                                     help="Growth in year t = starting growth x fade^t.")
             cfg["cost_ratio"] = st.slider("Cost growth as a share of revenue growth", 0.2, 1.0, DEFAULT_COST_RATIO, 0.05,
                                           help="Lower means more operating leverage.")
-    clicked = sb.button("Run audit 🚀", type="primary")
+    clicked = sb.button("Load backdrop 🌍" if mode == MODE_MACRO else "Run audit 🚀", type="primary")
     sb.caption("Screening tool for research and education. Not investment advice.")
     return cfg, clicked
 
@@ -1202,6 +1872,10 @@ def load(ticker):
 def run_public(cfg):
     snap = load(cfg["ticker"])
     m = extract_public_metrics(snap)
+    try:
+        m["stress"] = stress_inputs(snap, m)
+    except Exception:  # noqa: BLE001 - the stress tests are an optional extra: never let them stop the screen
+        m["stress"] = None
     rule = sector_rule(m["sector"], m["industry"])
     if rule and rule[0] == "exclude" and not cfg["allow_excluded"]:
         render_excluded(m, rule[1])
@@ -1252,11 +1926,19 @@ def run_venture(cfg):
     render_venture(vi, cfg["fade"], cfg["cost_ratio"])
 
 
+def run_macro(cfg):
+    mc = cfg["macro"]
+    with st.spinner("Fetching US and India market data (the first load can take about ten seconds)..."):
+        data = collect_macro(mc)
+    show_macro_panel(data, mc)
+
+
 def main():
     st.title("🛡️ Anti-Fragile Stock & Startup Screener")
     st.markdown(
         "A **15-pillar screen** for profitable listed companies and a **venture lens** for pre-profit and growth "
-        "companies. Missing data is shown as *n/a* and left out of the score. It is never invented."
+        "companies. Missing data is shown as *n/a* and left out of the score. It is never invented. An optional "
+        "**macro overlay** (rate links, stress tests and a US and India backdrop) is off by default."
     )
     cfg, clicked = sidebar()
     if clicked:
@@ -1264,13 +1946,15 @@ def main():
     active = st.session_state.get("active_cfg")
 
     if not active:
-        say("info", "👈 Choose a mode and a target in the sidebar, then click **Run audit**.")
+        say("info", "👈 Choose a mode and a target in the sidebar, then click the button at the bottom of the sidebar.")
     else:
         if active != cfg:
-            st.caption("Sidebar settings changed since the last run. Click Run audit to refresh the results.")
+            st.caption("Sidebar settings changed since the last run. Click the button again to refresh the results.")
         try:
             if active["mode"] == MODE_PUBLIC:
                 run_public(active)
+            elif active["mode"] == MODE_MACRO:
+                run_macro(active)
             else:
                 run_venture(active)
         except DataError as exc:
@@ -1295,12 +1979,17 @@ def main():
             "- **Forward valuation:** a transparent illustration built from conservative, capped growth, an exit "
             "multiple that can shrink but never expands, and a margin of safety. It is deliberately harsh on "
             "high-multiple growth stocks. Analyst targets are shown for reference and never used.\n"
+            "- **Macro overlay (optional, off by default):** the rate links change only the required return and the "
+            "exit-multiple floor inside the illustrative forward valuation, never a pillar score. The stress tests and "
+            "the macro backdrop are information only, and regulation is a flag you set yourself. The caution rules and "
+            "cut-offs are rules of thumb that have not been tested across market regimes.\n"
             "- **Venture projection:** revenue growth fades each year while the cost base grows more slowly, "
             "which gives a breakeven year and a funding gap. It is a what-if tool, not a forecast.\n"
             "- **Data:** Yahoo Finance via yfinance is unofficial and can be incomplete or delayed. "
             "Compare the *Inputs used* tab with the company's filings."
         )
     st.caption(DISCLAIMER)
+    st.caption(f"App version {APP_VERSION}.")
 
 
 if __name__ == "__main__":
