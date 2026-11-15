@@ -1,139 +1,454 @@
-import streamlit as st
-import pandas as pd
-import yfinance as yf
 import io
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.formatting.rule import CellIsRule
 from datetime import datetime
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+import pandas as pd
+import streamlit as st
+import yfinance as yf
 
-st.set_page_config(page_title="Valuation & Audit Suite", page_icon="📈", layout="wide")
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="Anti-Fragile & Startup Evaluator", page_icon="🛡️", layout="wide"
+)
 
-st.title("📈 Anti-Fragile Stock & Startup Evaluation Suite")
-st.markdown("Generate institutional-grade 16-pillar scorecards, live market valuations, or startup unit-economics with automatic pre-profit detection.")
+st.title("🛡️ Anti-Fragile Unified Stock & Startup Evaluation Engine")
+st.markdown(
+    "Evaluate mature compounders, high-growth public equities, or early-stage pre-profit startups with automated red-flag detection."
+)
 
-# Sidebar navigation
-app_mode = st.sidebar.selectbox("Select Evaluation Model", ["Public Stock Evaluator", "Pre-Profit Startup Evaluation Mode"])
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("Configuration & Mode")
+eval_mode = st.sidebar.radio(
+    "Select Evaluation Mode",
+    ["Public Equity (16-Pillar)", "Pre-Profit Startup (Venture Lens)"],
+)
 
-if app_mode == "Public Stock Evaluator":
-    st.subheader("🏢 Public Listed Company Valuation Engine")
-    ticker = st.text_input("Enter Stock Ticker Symbol (e.g., AVGO, TSLA, NVDA):", value="AVGO").strip().upper()
+ticker_input = st.sidebar.text_input(
+    "Target Ticker or Company Name", value="BZ"
+).strip()
+mos_input = st.sidebar.slider(
+    "Margin of Safety / Discount Required", 0.05, 0.50, 0.20, 0.05
+)
 
-    if st.button("Generate Stock Scorecard"):
-        with st.spinner(f"Fetching live market data and computing valuation for {ticker}..."):
-            try:
-                stock = yf.Ticker(ticker)
-                info = stock.info or {}
-                
-                if not info or len(info) < 5:
-                    raise ValueError(f"Could not retrieve valid data for '{ticker}'. It may be invalid or delisted.")
+# Startup Manual Override Inputs (if evaluating private/pre-profit data directly)
+if eval_mode == "Pre-Profit Startup (Venture Lens)":
+  st.sidebar.subheader("Startup Custom Financials")
+  rev_growth_input = st.sidebar.slider(
+      "YoY Revenue Growth Rate (%)", 10, 300, 85, 5
+  ) / 100.0
+  gross_margin_input = st.sidebar.slider(
+      "Gross Margin (%)", 10, 95, 75, 5
+  ) / 100.0
+  burn_multiple_input = st.sidebar.slider(
+      "Burn Multiple (Burn / Net New ARR)", 0.5, 5.0, 1.4, 0.1
+  )
+  runway_months = st.sidebar.number_input(
+      "Cash Runway (Months)", min_value=1, max_value=60, value=24
+  )
 
-                cmp = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose') or 100.0
-                company_name = info.get('longName') or info.get('shortName') or ticker
-                sector = info.get('sector', 'Unknown')
-                fair_value = info.get('targetMeanPrice') or round(cmp * 1.25, 2)
-                analyst_rec = (info.get('recommendationKey') or 'HOLD').upper().replace('_', ' ')
-                num_analysts = info.get('numberOfAnalystOpinions', 5)
+run_audit = st.sidebar.button("Run Comprehensive Audit 🚀", type="primary")
 
-                gm_val = info.get('grossMargins') or 0.35
-                op_margin = info.get('operatingMargins') or 0.12
-                roe_val = info.get('returnOnEquity') or 0.10
-                de_val = info.get('debtToEquity') or 60.0
-                rg_val = info.get('revenueGrowth') or 0.05
-                eg_val = info.get('earningsGrowth') or 0.05
+if run_audit and ticker_input:
+  with st.spinner(f"Analyzing {ticker_input} under {eval_mode}..."):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    is_indian = ticker_input.endswith(".NS") or ticker_input.endswith(".BO")
+    curr_sym = "₹" if is_indian else "$"
 
-                fcf_val = info.get('freeCashflow') or 0
-                net_inc = info.get('netIncomeToCommon') or 0
-                eps_val = info.get('trailingEps') or 0
+    # Fetch live data if public, else use custom startup parameters
+    cmp = gm_val = roe_val = de_val = rg_val = fcf_val = net_inc = pe_val = (
+        fwd_pe_val
+    ) = peg_val = insider_val = fcf_yield_val = None
+    company_name = ticker_input
+    sector = "Unknown"
+    fair_value = 100.0
+    analyst_rec = "HOLD"
+    num_analysts = 5
+    op_margin = 0.15
+    eg_val = 0.05
 
-                pe_val = info.get('trailingPE') or 0.0
-                fwd_pe_val = info.get('forwardPE') or 0.0
-                peg_val = info.get('pegRatio') or 0.0
+    is_public = eval_mode == "Public Equity (16-Pillar)"
+    red_flags = []
 
-                insider_held = info.get('heldPercentInsiders')
-                insider_val = (insider_held * 100) if insider_held is not None else 5.0
+    if is_public:
+      try:
+        stock = yf.Ticker(ticker_input)
+        info = stock.info or {}
+        cmp = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+            or 100.0
+        )
+        company_name = info.get("longName") or info.get("shortName") or ticker_input
+        sector = info.get("sector", "Unknown")
+        fair_value = info.get("targetMeanPrice") or round(cmp * 1.25, 2)
+        analyst_rec = (
+            (info.get("recommendationKey") or "HOLD")
+            .upper()
+            .replace("_", " ")
+        )
+        num_analysts = info.get("numberOfAnalystOpinions", 5)
 
-                mcap = info.get('marketCap', 1)
-                fcf_yield_val = (fcf_val / mcap) * 100 if (mcap and mcap > 0 and fcf_val) else 0.0
+        gm_val = info.get("grossMargins", 0.35)
+        op_margin = info.get("operatingMargins", 0.12)
+        roe_val = info.get("returnOnEquity", 0.10)
+        de_val = info.get("debtToEquity", 60.0)
+        rg_val = info.get("revenueGrowth", 0.05)
+        eg_val = info.get("earningsGrowth", 0.05)
 
-                # --- PROFITABILITY CHECK ---
-                is_profitable = net_inc > 0 and eps_val > 0
+        fcf_val = info.get("freeCashflow", 10_000_000)
+        net_inc = info.get("netIncomeToCommon", 10_000_000)
 
-                if not is_profitable:
-                    st.error(f"🚨 **PROFITABILITY ALERT: NOT YET PROFITABLE**")
-                    st.warning(f"**{company_name} ({ticker})** has **not yet turned profitable** based on trailing twelve months (TTM) data.\n"
-                               f"- **Net Income:** ${net_inc:,.0f}\n"
-                               f"- **Trailing EPS:** ${eps_val:.2f}\n"
-                               f"*Note: Traditional P/E multiples and earnings-based quality filters have been adjusted for a pre-profit growth profile.*")
-                else:
-                    st.success(f"✅ **{company_name} ({ticker})** is currently profitable (Net Income: ${net_inc:,.0f} | EPS: ${eps_val:.2f}).")
+        pe_val = info.get("trailingPE", 25.0)
+        fwd_pe_val = info.get("forwardPE", 20.0)
+        peg_val = info.get("pegRatio", 1.5)
 
-                # 16 Pillars Scoring Logic (with pre-profit safeguards)
-                s11 = 5 if gm_val >= 0.50 else (4 if gm_val >= 0.35 else (3 if gm_val >= 0.20 else 2))
-                s12 = 5 if rg_val >= 0.15 else (4 if rg_val >= 0.08 else (3 if rg_val >= 0.0 else 2))
-                s13 = 4
-                s21 = 5 if roe_val >= 0.20 else (4 if roe_val >= 0.12 else (3 if roe_val >= 0.05 else 2))
-                s22 = s11
-                s23 = 5 if de_val < 50 else (4 if de_val < 150 else (3 if de_val < 300 else 2))
-                
-                fcf_ratio = (fcf_val / net_inc) if (net_inc and net_inc > 0) else 0.0
-                s24 = 3 if not is_profitable else (5 if fcf_ratio >= 1.0 else (4 if fcf_ratio >= 0.75 else 3))
-                
-                s31 = 5 if fcf_yield_val >= 7.0 else (4 if fcf_yield_val >= 4.0 else (3 if fcf_yield_val >= 2.0 else 2))
-                s32 = 3 if not is_profitable else (5 if (0 < peg_val <= 1.2) else 3)
-                s33 = 4
-                s34 = 5 if insider_val >= 10.0 else (4 if insider_val >= 3.0 else 2)
-                
-                s41, s42 = s21, s12
-                s43 = 5 if fcf_val > 0 else 2
-                s44 = 4
-                s45 = 5 if ("BUY" in analyst_rec or "OUTPERFORM" in analyst_rec) else 3
+        insider_held = info.get("heldPercentInsiders")
+        insider_val = (insider_held * 100) if insider_held is not None else 5.0
 
-                rows = [
-                    ("1.1", "Moat", "Competitive Advantage", 0.06, f"Gross Margin: {gm_val*100:.1f}%", s11, "Pricing power"),
-                    ("1.2", "Moat", "Market Dynamics", 0.06, f"Rev Growth: {rg_val*100:.1f}%", s12, "TAM growth"),
-                    ("1.3", "Moat", "Revenue Model Quality", 0.06, "Recurring / Sticky", s13, "Retention"),
-                    ("2.1", "Quality", "ROE / Capital Returns", 0.07, f"ROE: {roe_val*100:.1f}%", s21, "Efficiency"),
-                    ("2.2", "Quality", "Gross Margin Floor", 0.07, f"GM: {gm_val*100:.1f}%", s22, "Margin stability"),
-                    ("2.3", "Quality", "Debt Leverage", 0.07, f"D/E: {de_val:.1f}%", s23, "Solvency"),
-                    ("2.4", "Quality", "FCF Conversion", 0.07, f"Net Inc: {'Negative' if not is_profitable else f'{fcf_ratio*100:.1f}%'}", s24, "Cash quality"),
-                    ("3.1", "Valuation", "FCF Yield", 0.07, f"Yield: {fcf_yield_val:.1f}%", s31, "Cash yield"),
-                    ("3.2", "Valuation", "PEG & P/E Multiple", 0.06, f"{'Pre-Profit' if not is_profitable else f'PEG: {peg_val:.2f}x'}", s32, "Growth multiple"),
-                    ("3.3", "Governance", "Management Alignment", 0.06, "Shareholder returns", s33, "Capital policy"),
-                    ("3.4", "Governance", "Insider Ownership", 0.05, f"Insiders: {insider_val:.1f}%", s34, "Skin in game"),
-                    ("4.1", "Filters", "Multi-Yr Return Trend", 0.06, f"ROE: {roe_val*100:.1f}%", s41, "Durability"),
-                    ("4.2", "Filters", "Top-Line Compounding", 0.06, f"Rev Growth: {rg_val*100:.1f}%", s42, "Expansion"),
-                    ("4.3", "Filters", "Positive Free Cash Flow", 0.06, f"FCF: ${fcf_val:,.0f}", s43, "Self-funding"),
-                    ("4.4", "Filters", "Insider Net Action", 0.06, "Stable", s44, "Recent activity"),
-                    ("4.5", "Consensus", "Analyst Rating", 0.06, f"{analyst_rec} (${fair_value:,.2f})", s45, f"{num_analysts} analysts"),
-                ]
+        mcap = info.get("marketCap", 1)
+        fcf_yield_val = (fcf_val / mcap) * 100 if (mcap and mcap > 0 and fcf_val) else 2.5
+      except Exception as e:
+        st.warning(
+            f"Could not fetch live public market data ({e}). Using baseline"
+            " estimates."
+        )
 
-                base_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
-                final_score = max(1.0, min(5.0, base_score))
+      # --- RED FLAG DETECTOR FOR PUBLIC EQUITIES ---
+      if de_val and de_val > 150:
+        red_flags.append(
+            f"High Leverage Warning: Debt-to-Equity is {de_val:.1f}%, exceeding"
+            " the safe 150% threshold."
+        )
+      if fcf_val and fcf_val < 0:
+        red_flags.append(
+            "Negative Free Cash Flow: Company is currently burning cash"
+            " operations."
+        )
+      if peg_val and peg_val > 2.5:
+        red_flags.append(
+            f"Valuation Premium Risk: PEG ratio of {peg_val:.2f}x signals overpaid"
+            " growth."
+        )
+      if roe_val and roe_val < 0.05:
+        red_flags.append(
+            f"Low Capital Efficiency: ROE is {roe_val*100:.1f}%, indicating poor"
+            " returns on equity."
+        )
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Final Score", f"{final_score:.2f} / 5.00")
-                col2.metric("Net Income Status", "🔴 Pre-Profit" if not is_profitable else "🟢 Profitable")
-                col3.metric("CMP", f"${cmp:,.2f}")
+      # --- 16 PILLAR SCORING (PUBLIC) ---
+      s11 = (
+          5
+          if gm_val >= 0.50
+          else (4 if gm_val >= 0.35 else (3 if gm_val >= 0.20 else 2))
+      )
+      s12 = (
+          5
+          if rg_val >= 0.15
+          else (4 if rg_val >= 0.08 else (3 if rg_val >= 0.0 else 2))
+      )
+      s13 = 4
+      s21 = (
+          5
+          if roe_val >= 0.20
+          else (4 if roe_val >= 0.12 else (3 if roe_val >= 0.05 else 2))
+      )
+      s22 = s11
+      s23 = 5 if de_val < 50 else (4 if de_val < 150 else (3 if de_val < 300 else 2))
+      fcf_ratio = (fcf_val / net_inc) if net_inc and net_inc > 0 else 0.5
+      s24 = (
+          5
+          if fcf_ratio >= 1.0
+          else (4 if fcf_ratio >= 0.75 else (3 if fcf_ratio >= 0.5 else 2))
+      )
+      s31 = (
+          5
+          if fcf_yield_val >= 7.0
+          else (
+              4
+              if fcf_yield_val >= 4.0
+              else (3 if fcf_yield_val >= 2.0 else 2)
+          )
+      )
+      s32 = (
+          5
+          if (0 < peg_val <= 1.2)
+          else (
+              4 if (1.2 < peg_val <= 2.0) else (3 if peg_val > 0 else 2)
+          )
+      )
+      s33 = 4
+      s34 = (
+          5
+          if insider_val >= 10.0
+          else (4 if insider_val >= 3.0 else (3 if insider_val >= 1.0 else 2))
+      )
+      s41, s42 = s21, s12
+      s43 = 5 if fcf_val > 0 else 3
+      s44 = 4
+      s45 = (
+          5
+          if ("BUY" in analyst_rec or "OUTPERFORM" in analyst_rec)
+          else (3 if "HOLD" in analyst_rec else 2)
+      )
 
-                st.subheader("📋 16-Pillar Scorecard Breakdown")
-                st.dataframe(
-                    [{"Ref": r[0], "Category": r[1], "Pillar": r[2], "Live Metric": r[4], "Score": r[5], "Notes": r[6]} for r in rows],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+      rows = [
+          (
+              "1.1",
+              "Moat",
+              "Competitive Advantage",
+              0.06,
+              f"Gross Margin: {gm_val*100:.1f}%",
+              s11,
+              "Pricing power",
+          ),
+          (
+              "1.2",
+              "Moat",
+              "Market Dynamics",
+              0.06,
+              f"Rev Growth: {rg_val*100:.1f}%",
+              s12,
+              "TAM growth",
+          ),
+          ("1.3", "Moat", "Revenue Model Quality", 0.06, "Recurring", s13, "Retention"),
+          (
+              "2.1",
+              "Quality",
+              "ROE / Returns",
+              0.07,
+              f"ROE: {roe_val*100:.1f}%",
+              s21,
+              "Efficiency",
+          ),
+          (
+              "2.2",
+              "Quality",
+              "Gross Margin Floor",
+              0.07,
+              f"GM: {gm_val*100:.1f}%",
+              s22,
+              "Stability",
+          ),
+          (
+              "2.3",
+              "Quality",
+              "Debt Leverage",
+              0.07,
+              f"D/E: {de_val:.1f}%",
+              s23,
+              "Solvency",
+          ),
+          (
+              "2.4",
+              "Quality",
+              "FCF Conversion",
+              0.07,
+              f"FCF/NI: {fcf_ratio*100:.1f}%",
+              s24,
+              "Cash quality",
+          ),
+          (
+              "3.1",
+              "Valuation",
+              "FCF Yield",
+              0.07,
+              f"Yield: {fcf_yield_val:.1f}%",
+              s31,
+              "Cash yield",
+          ),
+          (
+              "3.2",
+              "Valuation",
+              "PEG Multiple",
+              0.06,
+              f"PEG: {peg_val:.2f}x",
+              s32,
+              "Growth multiple",
+          ),
+          (
+              "3.3",
+              "Governance",
+              "Alignment",
+              0.06,
+              "Shareholder returns",
+              s33,
+              "Capital policy",
+          ),
+          (
+              "3.4",
+              "Governance",
+              "Insider Ownership",
+              0.05,
+              f"Insiders: {insider_val:.1f}%",
+              s34,
+              "Skin in game",
+          ),
+          (
+              "4.1",
+              "Filters",
+              "Multi-Yr Return",
+              0.06,
+              f"ROE: {roe_val*100:.1f}%",
+              s41,
+              "Durability",
+          ),
+          (
+              "4.2",
+              "Filters",
+              "Top-Line Compounding",
+              0.06,
+              f"Rev Growth: {rg_val*100:.1f}%",
+              s42,
+              "Expansion",
+          ),
+          (
+              "4.3",
+              "Filters",
+              "Positive FCF",
+              0.06,
+              f"FCF: {curr_sym}{fcf_val:,.0f}",
+              s43,
+              "Self-funding",
+          ),
+          ("4.4", "Filters", "Insider Activity", 0.06, "Stable", s44, "Net action"),
+          (
+              "4.5",
+              "Consensus",
+              "Analyst Rating",
+              0.06,
+              f"{analyst_rec}",
+              s45,
+              "Analyst view",
+          ),
+      ]
+      base_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
+      final_score = max(1.0, min(5.0, base_score))
+      verdict = (
+          "PASS / BUY"
+          if final_score >= 4.0
+          else ("WATCH / HOLD" if final_score >= 3.2 else "FAIL / AVOID")
+      )
 
-            except Exception as e:
-                st.error(f"Error evaluating ticker: {e}")
-
-elif app_mode == "Pre-Profit Startup Evaluation Mode":
-    st.subheader("🚀 Pre-Profit / Early-Stage Startup Unit-Economics Engine")
-    st.info("Use this mode to evaluate early-stage businesses where profitability has not yet been achieved.")
-    burn_rate = st.number_input("Monthly Burn Rate ($)", value=50000)
-    cash_reserves = st.number_input("Total Cash Reserves ($)", value=600000)
-    runway_months = cash_reserves / burn_rate if burn_rate > 0 else 0
-    st.metric("Estimated Runway", f"{runway_months:.1f} Months")
-    if runway_months < 12:
-        st.error("⚠️ **Critical Runway Alert:** Runway is under 12 months. Immediate fundraising or cost reduction required.")
     else:
-        st.success("✅ **Healthy Runway:** Runway exceeds 12 months.")
+      # --- PRE-PROFIT STARTUP / VENTURE LENS ---
+      # Evaluates unit economics, scalability, and burn efficiency instead of trailing FCF
+      if runway_months < 12:
+        red_flags.append(
+            f"Critical Runway Risk: Only {runway_months} months of cash runway"
+            " remaining."
+        )
+      if burn_multiple_input > 2.5:
+        red_flags.append(
+            f"Inefficient Burn: Burn Multiple is {burn_multiple_input}x"
+            " (burning >$2.50 for every $1 of new ARR)."
+        )
+      if gross_margin_input < 0.50:
+        red_flags.append(
+            f"Low Gross Margin: {gross_margin_input*100:.1f}% fails software /"
+            " scalable unit economic hurdles."
+        )
+
+      s11 = 5 if gross_margin_input >= 0.75 else (4 if gross_margin_input >= 0.60 else 2)
+      s12 = 5 if rev_growth_input >= 1.0 else (4 if rev_growth_input >= 0.50 else 2)
+      s13 = 5 if burn_multiple_input <= 1.2 else (3 if burn_multiple_input <= 2.0 else 1)
+      s14 = 5 if runway_months >= 24 else (3 if runway_months >= 12 else 1)
+
+      rows = [
+          (
+              "S.1",
+              "Unit Economics",
+              "Gross Margin Profile",
+              0.25,
+              f"GM: {gross_margin_input*100:.1f}%",
+              s11,
+              "Scalability",
+          ),
+          (
+              "S.2",
+              "Growth",
+              "Top-Line Velocity",
+              0.25,
+              f"YoY Growth: {rev_growth_input*100:.1f}%",
+              s12,
+              "Traction",
+          ),
+          (
+              "S.3",
+              "Efficiency",
+              "Burn Multiple",
+              0.25,
+              f"Burn Mult: {burn_multiple_input}x",
+              s13,
+              "Capital efficiency",
+          ),
+          (
+              "S.4",
+              "Risk",
+              "Cash Runway",
+              0.25,
+              f"Runway: {runway_months} mos",
+              s14,
+              "Survival horizon",
+          ),
+      ]
+      final_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
+      verdict = (
+          "HIGH-POTENTIAL VENTURE"
+          if final_score >= 4.0
+          else ("WATCHLIST STARTUP" if final_score >= 3.0 else "HIGH BURN RISK")
+      )
+
+    # --- RENDER DASHBOARD ---
+    st.subheader(f"Evaluation Dashboard: {company_name}")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Evaluation Mode", eval_mode.split("(")[0])
+    col2.metric("Composite Score", f"{final_score:.2f} / 5.00")
+    if is_public:
+      col3.metric("CMP", f"{curr_sym}{cmp:,.2f}")
+      col4.metric("Target Buy Price", f"{curr_sym}{fair_value * (1 - mos_input):,.2f}")
+    else:
+      col3.metric("Runway", f"{runway_months} Months")
+      col4.metric("Burn Multiple", f"{burn_multiple_input}x")
+
+    # Verdict Banner
+    if "PASS" in verdict or "VENTURE" in verdict:
+      st.success(f"**Verdict:** {verdict}")
+    elif "WATCH" in verdict:
+      st.warning(f"**Verdict:** {verdict}")
+    else:
+      st.error(f"**Verdict:** {verdict}")
+
+    # --- RED FLAG ALERT BOX ---
+    if red_flags:
+      st.error("🚨 **Automated Red Flags Detected:**")
+      for flag in red_flags:
+        st.markdown(f"- {flag}")
+    else:
+      st.success(
+          "✅ **Clean Audit:** No critical structural red flags triggered."
+      )
+
+    # Pillar Breakdown Table
+    st.markdown("### Detailed Pillar Scorecard")
+    df_display = pd.DataFrame(
+        [
+            {
+                "Ref": r[0],
+                "Category": r[1],
+                "Pillar / Criteria": r[2],
+                "Weight": f"{r[3]*100:.0f}%" if is_public else f"{r[3]*100:.0f}%",
+                "Metric": r[4],
+                "Score": r[5],
+                "Notes": r[6],
+            }
+            for r in rows
+        ]
+    )
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
+else:
+  st.info(
+      "👈 Configure your target company in the sidebar and click **Run"
+      " Comprehensive Audit** to begin."
+  )
