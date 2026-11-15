@@ -379,21 +379,17 @@ if run_audit:
       target_buy_price = fair_value * (1 - mos_input)
 
       # --- YEAR 1 & YEAR 2 FORECAST MODEL (PEG & PROFIT GROWTH) ---
-      # Use earnings growth (or default to 10% if missing)
       g_rate = eg_val if eg_val and -0.8 < eg_val < 2.0 else 0.12
       
-      # Projected EPS & Estimated Profit (Net Income)
       est_net_inc_yr1 = net_inc * (1 + g_rate)
       est_net_inc_yr2 = est_net_inc_yr1 * (1 + g_rate)
       
       proj_eps_yr1 = trailing_eps * (1 + g_rate)
       proj_eps_yr2 = proj_eps_yr1 * (1 + g_rate)
       
-      # Implied P/E multiplier derived from PEG ratio & growth rate
-      # PEG = (P/E) / GrowthRate -> Target P/E = PEG * (GrowthRate * 100)
       base_peg = peg_val if peg_val and peg_val > 0 else 1.5
       implied_pe = base_peg * (max(g_rate, 0.05) * 100)
-      safe_pe = min(max(implied_pe, 8.0), 50.0)  # Bound P/E between 8x and 50x
+      safe_pe = min(max(implied_pe, 8.0), 50.0)
       
       forecast_price_yr1 = proj_eps_yr1 * safe_pe
       forecast_price_yr2 = proj_eps_yr2 * safe_pe
@@ -540,7 +536,7 @@ if run_audit:
   else:
     st.success("✅ **Clean Audit:** No critical structural red flags triggered.")
 
-  # --- INTERACTIVE PLOTLY VISUALIZATION (FIXED FONT & HEIGHT) ---
+  # --- INTERACTIVE PLOTLY VISUALIZATION ---
   st.markdown("### 📊 Visual Score Breakdown")
   df_chart = pd.DataFrame(
       [
@@ -565,13 +561,12 @@ if run_audit:
       text="Metric",
       title="Pillar Score Distribution (Scale 1 to 5)",
   )
-  # Updated trace and layout settings to fix font sizes and spacing
   fig.update_traces(
       textfont_size=13, textangle=0, textposition="inside", cliponaxis=False
   )
   fig.update_layout(
       yaxis={"categoryorder": "total ascending"},
-      height=650,  # Increased height so text labels never overlap
+      height=650,
       font=dict(size=14, color="#1E293B"),
       margin=dict(l=20, r=20, t=50, b=20),
   )
@@ -597,9 +592,27 @@ if run_audit:
 
   # --- EDUCATIONAL REFERENCES & EXPLANATIONS ---
   with st.expander("📚 Educational Reference & Glossary for Key Metrics"):
-    st.markdown("""
-        To learn more about how these financial concepts are evaluated in institutional analysis, explore these references:
-        * **[Investopedia: Margin of Safety](https://www.investopedia.com/terms/m/marginofsafety.asp)** — Explains the principle of purchasing assets below their intrinsic fair value to mitigate downside risk.
-        * **[Bessemer Venture Partners: Burn Multiple](https://www.bvp.com/atlas/the-burn-multiple)** — A premier metric for evaluating how efficiently a pre-profit startup turns capital burn into net new Annual Recurring Revenue (ARR).
-        * **[Corporate Finance Institute: Debt-to-Equity Ratio](https://corporatefinanceinstitute.com/resources/commercial-lending/debt-to-equity-ratio/)** — Measures financial leverage and long-term solvency risk.
-        * **[Sifted: Net Revenue Retention (NRR)](
+    st.markdown(
+        "To learn more about how these financial concepts are evaluated in"
+        " institutional analysis, explore these references:\n"
+        "* **[Investopedia: Margin of"
+        " Safety](https://www.investopedia.com/terms/m/marginofsafety.asp)** —"
+        " Explains the principle of purchasing assets below their intrinsic"
+        " fair value to mitigate downside risk.\n"
+        "* **[Bessemer Venture Partners: Burn"
+        " Multiple](https://www.bvp.com/atlas/the-burn-multiple)** — A premier"
+        " metric for evaluating how efficiently a pre-profit startup turns"
+        " capital burn into net new Annual Recurring Revenue (ARR).\n"
+        "* **[Corporate Finance Institute: Debt-to-Equity"
+        " Ratio](https://corporatefinanceinstitute.com/resources/commercial-lending/debt-to-equity-ratio/)**"
+        " — Measures financial leverage and long-term solvency risk.\n"
+        "* **[Sifted: Net Revenue Retention"
+        " (NRR)](https://sifted.eu/)** — Analyzes customer expansion and"
+        " product stickiness over time."
+    )
+
+else:
+  st.info(
+      "👈 Configure your target company or startup in the sidebar and click"
+      " **Run Comprehensive Audit** to begin."
+  )
