@@ -8,47 +8,56 @@ import yfinance as yf
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Anti-Fragile & Startup Evaluator", page_icon="🛡️", layout="wide"
+    page_title="Anti-Fragile Stock & Startup Engine",
+    page_icon="🛡️",
+    layout="wide",
 )
 
 st.title("🛡️ Anti-Fragile Unified Stock & Startup Evaluation Engine")
 st.markdown(
-    "Evaluate mature compounders, high-growth public equities, or early-stage"
-    " pre-profit startups with automated red-flag detection."
+    "Comprehensive evaluation suite featuring the **16-Pillar + Risk Overlay"
+    " Framework** for Public Equities and the **Venture Lens** for Pre-Profit"
+    " Startups."
 )
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Configuration & Mode")
 eval_mode = st.sidebar.radio(
     "Select Evaluation Mode",
-    ["Public Equity (16-Pillar)", "Pre-Profit Startup (Venture Lens)"],
+    ["Public Equity (16-Pillar + Overlays)", "Pre-Profit Startup (Venture Lens)"],
 )
 
-if eval_mode == "Public Equity (16-Pillar)":
+if eval_mode == "Public Equity (16-Pillar + Overlays)":
   ticker_input = st.sidebar.text_input(
       "Target Public Ticker", value="BZ"
   ).strip().upper()
   mos_input = st.sidebar.slider(
-      "Margin of Safety / Discount Required", 0.05, 0.50, 0.20, 0.05
+      "Margin of Safety Required", 0.05, 0.50, 0.20, 0.05
   )
 else:
   st.sidebar.info(
-      "💡 **Startup Mode Notice:** This mode simulates an early-stage private"
-      " company using the financial sliders below, rather than pulling public"
-      " market tickers."
+      "💡 **Startup Mode Notice:** Evaluates early-stage pre-profit companies"
+      " using venture metrics."
   )
   startup_name = st.sidebar.text_input(
       "Startup Company Name", value="My SaaS Venture"
   ).strip()
-  st.sidebar.subheader("Startup Custom Financials")
-  rev_growth_input = st.sidebar.slider(
-      "YoY Revenue Growth Rate (%)", 10, 300, 85, 5
-  ) / 100.0
+  st.sidebar.subheader("Startup Venture Parameters")
   gross_margin_input = st.sidebar.slider(
       "Gross Margin (%)", 10, 95, 75, 5
   ) / 100.0
+  rev_growth_input = st.sidebar.slider(
+      "YoY ARR Growth Rate (%)", 10, 400, 100, 10
+  ) / 100.0
   burn_multiple_input = st.sidebar.slider(
-      "Burn Multiple (Burn / Net New ARR)", 0.5, 5.0, 1.4, 0.1
+      "Burn Multiple (Burn / Net New ARR)", 0.5, 5.0, 1.3, 0.1
+  )
+  nrr_input = st.sidebar.slider(
+      "Net Revenue Retention (NRR %)", 80, 150, 115, 5
+  ) / 100.0
+  tam_input = st.sidebar.selectbox(
+      "Total Addressable Market (TAM)",
+      ["Massive ($10B+)", "Large ($1B-$10B)", "Niche (<$1B)"],
   )
   runway_months = st.sidebar.number_input(
       "Cash Runway (Months)", min_value=1, max_value=60, value=24
@@ -57,10 +66,9 @@ else:
 run_audit = st.sidebar.button("Run Comprehensive Audit 🚀", type="primary")
 
 if run_audit:
-  today_str = datetime.now().strftime("%Y-%m-%d")
   red_flags = []
 
-  if eval_mode == "Public Equity (16-Pillar)":
+  if eval_mode == "Public Equity (16-Pillar + Overlays)":
     if not ticker_input:
       st.error("Please enter a valid ticker symbol.")
       st.stop()
@@ -70,6 +78,7 @@ if run_audit:
     ):
       is_indian = ticker_input.endswith(".NS") or ticker_input.endswith(".BO")
       curr_sym = "₹" if is_indian else "$"
+      today_str = datetime.now().strftime("%Y-%m-%d")
 
       cmp = gm_val = roe_val = de_val = rg_val = fcf_val = net_inc = pe_val = (
           fwd_pe_val
@@ -134,7 +143,7 @@ if run_audit:
         )
       if fcf_val and fcf_val < 0:
         red_flags.append(
-            "Negative Free Cash Flow: Company is currently burning cash"
+            "Negative Free Cash Flow: Company is currently burning cash in"
             " operations."
         )
       if peg_val and peg_val > 2.5:
@@ -335,15 +344,40 @@ if run_audit:
           ),
       ]
       base_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
-      final_score = max(1.0, min(5.0, base_score))
-      verdict = (
-          "PASS / BUY"
-          if final_score >= 4.0
-          else ("WATCH / HOLD" if final_score >= 3.2 else "FAIL / AVOID")
+
+      # Risk Overlays Calculations
+      eps_rev_pct = eg_val if eg_val < -0.05 else 0.0
+      bookings_delta = eg_val - rg_val
+      val_cap_flag = (
+          1 if (fwd_pe_val and fwd_pe_val >= 45.0 and peg_val > 2.5) else 0
+      )
+      cyclical_ratio = (
+          round(op_margin / 0.15, 2)
+          if sector in {"Energy", "Basic Materials", "Industrials"}
+          else 1.0
       )
 
+      penalties = (
+          (-0.50 if eps_rev_pct < -0.05 else 0.0)
+          + (-0.40 if bookings_delta < 0.0 else 0.0)
+          + (-0.60 if val_cap_flag >= 1 else 0.0)
+          + (-0.50 if cyclical_ratio > 1.50 else 0.0)
+      )
+      final_score = max(1.0, min(5.0, base_score + penalties))
+
+      if val_cap_flag >= 1:
+        verdict = "NEUTRAL / VAL CAP"
+      elif final_score >= 4.0:
+        verdict = "PASS / BUY"
+      elif final_score >= 3.2:
+        verdict = "WATCH / HOLD"
+      else:
+        verdict = "FAIL / AVOID"
+
+      target_buy_price = fair_value * (1 - mos_input)
+
   else:
-    # --- PRE-PROFIT STARTUP / VENTURE LENS ---
+    # --- PRE-PROFIT STARTUP / VENTURE LENS (EXPANDED PARAMETERS) ---
     company_name = startup_name
     curr_sym = "$"
 
@@ -359,21 +393,24 @@ if run_audit:
       )
     if gross_margin_input < 0.50:
       red_flags.append(
-          f"Low Gross Margin: {gross_margin_input*100:.1f}% fails software /"
-          " scalable unit economic hurdles."
+          f"Low Gross Margin: {gross_margin_input*100:.1f}% fails scalable unit"
+          " economic hurdles."
       )
 
+    # Expanded Startup Parameter Scoring
     s11 = 5 if gross_margin_input >= 0.75 else (4 if gross_margin_input >= 0.60 else 2)
     s12 = 5 if rev_growth_input >= 1.0 else (4 if rev_growth_input >= 0.50 else 2)
     s13 = 5 if burn_multiple_input <= 1.2 else (3 if burn_multiple_input <= 2.0 else 1)
-    s14 = 5 if runway_months >= 24 else (3 if runway_months >= 12 else 1)
+    s14 = 5 if nrr_input >= 1.20 else (4 if nrr_input >= 1.05 else 2)
+    s15 = 5 if tam_input == "Massive ($10B+)" else (3 if tam_input == "Large ($1B-$10B)" else 1)
+    s16 = 5 if runway_months >= 24 else (3 if runway_months >= 12 else 1)
 
     rows = [
         (
             "S.1",
             "Unit Economics",
             "Gross Margin Profile",
-            0.25,
+            0.15,
             f"GM: {gross_margin_input*100:.1f}%",
             s11,
             "Scalability",
@@ -381,29 +418,47 @@ if run_audit:
         (
             "S.2",
             "Growth",
-            "Top-Line Velocity",
-            0.25,
-            f"YoY Growth: {rev_growth_input*100:.1f}%",
+            "Top-Line ARR Growth",
+            0.20,
+            f"YoY: {rev_growth_input*100:.1f}%",
             s12,
-            "Traction",
+            "Traction velocity",
         ),
         (
             "S.3",
             "Efficiency",
             "Burn Multiple",
-            0.25,
+            0.20,
             f"Burn Mult: {burn_multiple_input}x",
             s13,
             "Capital efficiency",
         ),
         (
             "S.4",
-            "Risk",
-            "Cash Runway",
-            0.25,
-            f"Runway: {runway_months} mos",
+            "Retention",
+            "Net Revenue Retention",
+            0.15,
+            f"NRR: {nrr_input*100:.1f}%",
             s14,
-            "Survival horizon",
+            "Product stickiness",
+        ),
+        (
+            "S.5",
+            "Market",
+            "Addressable Market (TAM)",
+            0.15,
+            f"{tam_input}",
+            s15,
+            "Market ceiling",
+        ),
+        (
+            "S.6",
+            "Risk",
+            "Cash Runway Horizon",
+            0.15,
+            f"Runway: {runway_months} mos",
+            s16,
+            "Survival buffer",
         ),
     ]
     final_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
@@ -419,11 +474,16 @@ if run_audit:
   col1, col2, col3, col4 = st.columns(4)
   col1.metric("Evaluation Mode", eval_mode.split("(")[0])
   col2.metric("Composite Score", f"{final_score:.2f} / 5.00")
-  if eval_mode == "Public Equity (16-Pillar)":
+  if eval_mode.startswith("Public"):
     col3.metric("CMP", f"{curr_sym}{cmp:,.2f}")
-    col4.metric("Target Buy Price", f"{curr_sym}{fair_value * (1 - mos_input):,.2f}")
+    col4.metric(
+        "Target Max Buy Price",
+        f"{curr_sym}{target_buy_price:,.2f}",
+        delta="IN BUY ZONE" if cmp <= target_buy_price else "WAIT FOR DIP",
+        delta_color="normal" if cmp <= target_buy_price else "inverse",
+    )
   else:
-    col3.metric("Runway", f"{runway_months} Months")
+    col3.metric("Cash Runway", f"{runway_months} Months")
     col4.metric("Burn Multiple", f"{burn_multiple_input}x")
 
   # Verdict Banner
@@ -442,4 +502,26 @@ if run_audit:
   else:
     st.success("✅ **Clean Audit:** No critical structural red flags triggered.")
 
-  # Pillar Breakdown
+  # Pillar Breakdown Table
+  st.markdown("### Detailed Pillar Scorecard")
+  df_display = pd.DataFrame(
+      [
+          {
+              "Ref": r[0],
+              "Category": r[1],
+              "Pillar / Criteria": r[2],
+              "Weight": f"{r[3]*100:.0f}%",
+              "Metric": r[4],
+              "Score": r[5],
+              "Notes": r[6],
+          }
+          for r in rows
+      ]
+  )
+  st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+else:
+  st.info(
+      "👈 Configure your target company or startup in the sidebar and click"
+      " **Run Comprehensive Audit** to begin."
+  )
