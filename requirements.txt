@@ -1,5 +1,5 @@
 streamlit
-pandas
-yfinance>=0.2.0
+yfinance
 openpyxl
-# force reload
+pandas
+plotly
