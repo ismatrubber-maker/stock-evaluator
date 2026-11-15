@@ -13,7 +13,8 @@ st.set_page_config(
 
 st.title("🛡️ Anti-Fragile Unified Stock & Startup Evaluation Engine")
 st.markdown(
-    "Evaluate mature compounders, high-growth public equities, or early-stage pre-profit startups with automated red-flag detection."
+    "Evaluate mature compounders, high-growth public equities, or early-stage"
+    " pre-profit startups with automated red-flag detection."
 )
 
 # --- SIDEBAR CONTROLS ---
@@ -23,15 +24,22 @@ eval_mode = st.sidebar.radio(
     ["Public Equity (16-Pillar)", "Pre-Profit Startup (Venture Lens)"],
 )
 
-ticker_input = st.sidebar.text_input(
-    "Target Ticker or Company Name", value="BZ"
-).strip()
-mos_input = st.sidebar.slider(
-    "Margin of Safety / Discount Required", 0.05, 0.50, 0.20, 0.05
-)
-
-# Startup Manual Override Inputs (if evaluating private/pre-profit data directly)
-if eval_mode == "Pre-Profit Startup (Venture Lens)":
+if eval_mode == "Public Equity (16-Pillar)":
+  ticker_input = st.sidebar.text_input(
+      "Target Public Ticker", value="BZ"
+  ).strip().upper()
+  mos_input = st.sidebar.slider(
+      "Margin of Safety / Discount Required", 0.05, 0.50, 0.20, 0.05
+  )
+else:
+  st.sidebar.info(
+      "💡 **Startup Mode Notice:** This mode simulates an early-stage private"
+      " company using the financial sliders below, rather than pulling public"
+      " market tickers."
+  )
+  startup_name = st.sidebar.text_input(
+      "Startup Company Name", value="My SaaS Venture"
+  ).strip()
   st.sidebar.subheader("Startup Custom Financials")
   rev_growth_input = st.sidebar.slider(
       "YoY Revenue Growth Rate (%)", 10, 300, 85, 5
@@ -48,28 +56,32 @@ if eval_mode == "Pre-Profit Startup (Venture Lens)":
 
 run_audit = st.sidebar.button("Run Comprehensive Audit 🚀", type="primary")
 
-if run_audit and ticker_input:
-  with st.spinner(f"Analyzing {ticker_input} under {eval_mode}..."):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    is_indian = ticker_input.endswith(".NS") or ticker_input.endswith(".BO")
-    curr_sym = "₹" if is_indian else "$"
+if run_audit:
+  today_str = datetime.now().strftime("%Y-%m-%d")
+  red_flags = []
 
-    # Fetch live data if public, else use custom startup parameters
-    cmp = gm_val = roe_val = de_val = rg_val = fcf_val = net_inc = pe_val = (
-        fwd_pe_val
-    ) = peg_val = insider_val = fcf_yield_val = None
-    company_name = ticker_input
-    sector = "Unknown"
-    fair_value = 100.0
-    analyst_rec = "HOLD"
-    num_analysts = 5
-    op_margin = 0.15
-    eg_val = 0.05
+  if eval_mode == "Public Equity (16-Pillar)":
+    if not ticker_input:
+      st.error("Please enter a valid ticker symbol.")
+      st.stop()
 
-    is_public = eval_mode == "Public Equity (16-Pillar)"
-    red_flags = []
+    with st.spinner(
+        f"Analyzing public market fundamentals for {ticker_input}..."
+    ):
+      is_indian = ticker_input.endswith(".NS") or ticker_input.endswith(".BO")
+      curr_sym = "₹" if is_indian else "$"
 
-    if is_public:
+      cmp = gm_val = roe_val = de_val = rg_val = fcf_val = net_inc = pe_val = (
+          fwd_pe_val
+      ) = peg_val = insider_val = fcf_yield_val = None
+      company_name = ticker_input
+      sector = "Unknown"
+      fair_value = 100.0
+      analyst_rec = "HOLD"
+      num_analysts = 5
+      op_margin = 0.15
+      eg_val = 0.05
+
       try:
         stock = yf.Ticker(ticker_input)
         info = stock.info or {}
@@ -330,125 +342,104 @@ if run_audit and ticker_input:
           else ("WATCH / HOLD" if final_score >= 3.2 else "FAIL / AVOID")
       )
 
-    else:
-      # --- PRE-PROFIT STARTUP / VENTURE LENS ---
-      # Evaluates unit economics, scalability, and burn efficiency instead of trailing FCF
-      if runway_months < 12:
-        red_flags.append(
-            f"Critical Runway Risk: Only {runway_months} months of cash runway"
-            " remaining."
-        )
-      if burn_multiple_input > 2.5:
-        red_flags.append(
-            f"Inefficient Burn: Burn Multiple is {burn_multiple_input}x"
-            " (burning >$2.50 for every $1 of new ARR)."
-        )
-      if gross_margin_input < 0.50:
-        red_flags.append(
-            f"Low Gross Margin: {gross_margin_input*100:.1f}% fails software /"
-            " scalable unit economic hurdles."
-        )
+  else:
+    # --- PRE-PROFIT STARTUP / VENTURE LENS ---
+    company_name = startup_name
+    curr_sym = "$"
 
-      s11 = 5 if gross_margin_input >= 0.75 else (4 if gross_margin_input >= 0.60 else 2)
-      s12 = 5 if rev_growth_input >= 1.0 else (4 if rev_growth_input >= 0.50 else 2)
-      s13 = 5 if burn_multiple_input <= 1.2 else (3 if burn_multiple_input <= 2.0 else 1)
-      s14 = 5 if runway_months >= 24 else (3 if runway_months >= 12 else 1)
-
-      rows = [
-          (
-              "S.1",
-              "Unit Economics",
-              "Gross Margin Profile",
-              0.25,
-              f"GM: {gross_margin_input*100:.1f}%",
-              s11,
-              "Scalability",
-          ),
-          (
-              "S.2",
-              "Growth",
-              "Top-Line Velocity",
-              0.25,
-              f"YoY Growth: {rev_growth_input*100:.1f}%",
-              s12,
-              "Traction",
-          ),
-          (
-              "S.3",
-              "Efficiency",
-              "Burn Multiple",
-              0.25,
-              f"Burn Mult: {burn_multiple_input}x",
-              s13,
-              "Capital efficiency",
-          ),
-          (
-              "S.4",
-              "Risk",
-              "Cash Runway",
-              0.25,
-              f"Runway: {runway_months} mos",
-              s14,
-              "Survival horizon",
-          ),
-      ]
-      final_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
-      verdict = (
-          "HIGH-POTENTIAL VENTURE"
-          if final_score >= 4.0
-          else ("WATCHLIST STARTUP" if final_score >= 3.0 else "HIGH BURN RISK")
+    if runway_months < 12:
+      red_flags.append(
+          f"Critical Runway Risk: Only {runway_months} months of cash runway"
+          " remaining."
+      )
+    if burn_multiple_input > 2.5:
+      red_flags.append(
+          f"Inefficient Burn: Burn Multiple is {burn_multiple_input}x (burning"
+          " >$2.50 for every $1 of new ARR)."
+      )
+    if gross_margin_input < 0.50:
+      red_flags.append(
+          f"Low Gross Margin: {gross_margin_input*100:.1f}% fails software /"
+          " scalable unit economic hurdles."
       )
 
-    # --- RENDER DASHBOARD ---
-    st.subheader(f"Evaluation Dashboard: {company_name}")
+    s11 = 5 if gross_margin_input >= 0.75 else (4 if gross_margin_input >= 0.60 else 2)
+    s12 = 5 if rev_growth_input >= 1.0 else (4 if rev_growth_input >= 0.50 else 2)
+    s13 = 5 if burn_multiple_input <= 1.2 else (3 if burn_multiple_input <= 2.0 else 1)
+    s14 = 5 if runway_months >= 24 else (3 if runway_months >= 12 else 1)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Evaluation Mode", eval_mode.split("(")[0])
-    col2.metric("Composite Score", f"{final_score:.2f} / 5.00")
-    if is_public:
-      col3.metric("CMP", f"{curr_sym}{cmp:,.2f}")
-      col4.metric("Target Buy Price", f"{curr_sym}{fair_value * (1 - mos_input):,.2f}")
-    else:
-      col3.metric("Runway", f"{runway_months} Months")
-      col4.metric("Burn Multiple", f"{burn_multiple_input}x")
-
-    # Verdict Banner
-    if "PASS" in verdict or "VENTURE" in verdict:
-      st.success(f"**Verdict:** {verdict}")
-    elif "WATCH" in verdict:
-      st.warning(f"**Verdict:** {verdict}")
-    else:
-      st.error(f"**Verdict:** {verdict}")
-
-    # --- RED FLAG ALERT BOX ---
-    if red_flags:
-      st.error("🚨 **Automated Red Flags Detected:**")
-      for flag in red_flags:
-        st.markdown(f"- {flag}")
-    else:
-      st.success(
-          "✅ **Clean Audit:** No critical structural red flags triggered."
-      )
-
-    # Pillar Breakdown Table
-    st.markdown("### Detailed Pillar Scorecard")
-    df_display = pd.DataFrame(
-        [
-            {
-                "Ref": r[0],
-                "Category": r[1],
-                "Pillar / Criteria": r[2],
-                "Weight": f"{r[3]*100:.0f}%" if is_public else f"{r[3]*100:.0f}%",
-                "Metric": r[4],
-                "Score": r[5],
-                "Notes": r[6],
-            }
-            for r in rows
-        ]
+    rows = [
+        (
+            "S.1",
+            "Unit Economics",
+            "Gross Margin Profile",
+            0.25,
+            f"GM: {gross_margin_input*100:.1f}%",
+            s11,
+            "Scalability",
+        ),
+        (
+            "S.2",
+            "Growth",
+            "Top-Line Velocity",
+            0.25,
+            f"YoY Growth: {rev_growth_input*100:.1f}%",
+            s12,
+            "Traction",
+        ),
+        (
+            "S.3",
+            "Efficiency",
+            "Burn Multiple",
+            0.25,
+            f"Burn Mult: {burn_multiple_input}x",
+            s13,
+            "Capital efficiency",
+        ),
+        (
+            "S.4",
+            "Risk",
+            "Cash Runway",
+            0.25,
+            f"Runway: {runway_months} mos",
+            s14,
+            "Survival horizon",
+        ),
+    ]
+    final_score = sum(wt * sc for _, _, _, wt, _, sc, _ in rows)
+    verdict = (
+        "HIGH-POTENTIAL VENTURE"
+        if final_score >= 4.0
+        else ("WATCHLIST STARTUP" if final_score >= 3.0 else "HIGH BURN RISK")
     )
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
-else:
-  st.info(
-      "👈 Configure your target company in the sidebar and click **Run"
-      " Comprehensive Audit** to begin."
-  )
+
+  # --- RENDER DASHBOARD ---
+  st.subheader(f"Evaluation Dashboard: {company_name}")
+
+  col1, col2, col3, col4 = st.columns(4)
+  col1.metric("Evaluation Mode", eval_mode.split("(")[0])
+  col2.metric("Composite Score", f"{final_score:.2f} / 5.00")
+  if eval_mode == "Public Equity (16-Pillar)":
+    col3.metric("CMP", f"{curr_sym}{cmp:,.2f}")
+    col4.metric("Target Buy Price", f"{curr_sym}{fair_value * (1 - mos_input):,.2f}")
+  else:
+    col3.metric("Runway", f"{runway_months} Months")
+    col4.metric("Burn Multiple", f"{burn_multiple_input}x")
+
+  # Verdict Banner
+  if "PASS" in verdict or "VENTURE" in verdict:
+    st.success(f"**Verdict:** {verdict}")
+  elif "WATCH" in verdict:
+    st.warning(f"**Verdict:** {verdict}")
+  else:
+    st.error(f"**Verdict:** {verdict}")
+
+  # --- RED FLAG ALERT BOX ---
+  if red_flags:
+    st.error("🚨 **Automated Red Flags Detected:**")
+    for flag in red_flags:
+      st.markdown(f"- {flag}")
+  else:
+    st.success("✅ **Clean Audit:** No critical structural red flags triggered.")
+
+  # Pillar Breakdown
