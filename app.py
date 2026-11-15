@@ -30,7 +30,7 @@ eval_mode = st.sidebar.radio(
 
 if eval_mode == "Public Equity (16-Pillar + Overlays)":
   ticker_input = st.sidebar.text_input(
-      "Target Public Ticker", value="BZ"
+      "Target Public Ticker", value="NVDA"
   ).strip().upper()
   mos_input = st.sidebar.slider(
       "Margin of Safety Required", 0.05, 0.50, 0.20, 0.05
@@ -91,6 +91,7 @@ if run_audit:
       num_analysts = 5
       op_margin = 0.15
       eg_val = 0.05
+      trailing_eps = 2.0
 
       try:
         stock = yf.Ticker(ticker_input)
@@ -124,6 +125,7 @@ if run_audit:
         pe_val = info.get("trailingPE", 25.0)
         fwd_pe_val = info.get("forwardPE", 20.0)
         peg_val = info.get("pegRatio", 1.5)
+        trailing_eps = info.get("trailingEps") or (cmp / pe_val if pe_val else 2.0)
 
         insider_held = info.get("heldPercentInsiders")
         insider_val = (insider_held * 100) if insider_held is not None else 5.0
@@ -376,6 +378,26 @@ if run_audit:
 
       target_buy_price = fair_value * (1 - mos_input)
 
+      # --- YEAR 1 & YEAR 2 FORECAST MODEL (PEG & PROFIT GROWTH) ---
+      # Use earnings growth (or default to 10% if missing)
+      g_rate = eg_val if eg_val and -0.8 < eg_val < 2.0 else 0.12
+      
+      # Projected EPS & Estimated Profit (Net Income)
+      est_net_inc_yr1 = net_inc * (1 + g_rate)
+      est_net_inc_yr2 = est_net_inc_yr1 * (1 + g_rate)
+      
+      proj_eps_yr1 = trailing_eps * (1 + g_rate)
+      proj_eps_yr2 = proj_eps_yr1 * (1 + g_rate)
+      
+      # Implied P/E multiplier derived from PEG ratio & growth rate
+      # PEG = (P/E) / GrowthRate -> Target P/E = PEG * (GrowthRate * 100)
+      base_peg = peg_val if peg_val and peg_val > 0 else 1.5
+      implied_pe = base_peg * (max(g_rate, 0.05) * 100)
+      safe_pe = min(max(implied_pe, 8.0), 50.0)  # Bound P/E between 8x and 50x
+      
+      forecast_price_yr1 = proj_eps_yr1 * safe_pe
+      forecast_price_yr2 = proj_eps_yr2 * safe_pe
+
   else:
     # --- PRE-PROFIT STARTUP / VENTURE LENS ---
     company_name = startup_name
@@ -485,6 +507,23 @@ if run_audit:
     col3.metric("Cash Runway", f"{runway_months} Months")
     col4.metric("Burn Multiple", f"{burn_multiple_input}x")
 
+  # --- YEAR 1 & YEAR 2 FORECAST METRICS SECTION (PUBLIC MODE) ---
+  if eval_mode.startswith("Public"):
+    st.markdown("### 📈 Year 1 & Year 2 Forecast Model (PEG & Profit Growth)")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    fc1.metric(
+        "Year 1 Forecast Price",
+        f"{curr_sym}{forecast_price_yr1:,.2f}",
+        delta=f"{((forecast_price_yr1/cmp)-1)*100:+.1f}% vs CMP",
+    )
+    fc2.metric(
+        "Year 2 Forecast Price",
+        f"{curr_sym}{forecast_price_yr2:,.2f}",
+        delta=f"{((forecast_price_yr2/cmp)-1)*100:+.1f}% vs CMP",
+    )
+    fc3.metric("Est. Net Profit (Yr 1)", f"{curr_sym}{est_net_inc_yr1:,.0f}")
+    fc4.metric("Est. Net Profit (Yr 2)", f"{curr_sym}{est_net_inc_yr2:,.0f}")
+
   # Verdict Banner
   if "PASS" in verdict or "VENTURE" in verdict:
     st.success(f"**Verdict:** {verdict}")
@@ -501,7 +540,7 @@ if run_audit:
   else:
     st.success("✅ **Clean Audit:** No critical structural red flags triggered.")
 
-  # --- INTERACTIVE PLOTLY VISUALIZATION ---
+  # --- INTERACTIVE PLOTLY VISUALIZATION (FIXED FONT & HEIGHT) ---
   st.markdown("### 📊 Visual Score Breakdown")
   df_chart = pd.DataFrame(
       [
@@ -526,7 +565,16 @@ if run_audit:
       text="Metric",
       title="Pillar Score Distribution (Scale 1 to 5)",
   )
-  fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=400)
+  # Updated trace and layout settings to fix font sizes and spacing
+  fig.update_traces(
+      textfont_size=13, textangle=0, textposition="inside", cliponaxis=False
+  )
+  fig.update_layout(
+      yaxis={"categoryorder": "total ascending"},
+      height=650,  # Increased height so text labels never overlap
+      font=dict(size=14, color="#1E293B"),
+      margin=dict(l=20, r=20, t=50, b=20),
+  )
   st.plotly_chart(fig, use_container_width=True)
 
   # Detailed Pillar Scorecard Table
@@ -554,11 +602,4 @@ if run_audit:
         * **[Investopedia: Margin of Safety](https://www.investopedia.com/terms/m/marginofsafety.asp)** — Explains the principle of purchasing assets below their intrinsic fair value to mitigate downside risk.
         * **[Bessemer Venture Partners: Burn Multiple](https://www.bvp.com/atlas/the-burn-multiple)** — A premier metric for evaluating how efficiently a pre-profit startup turns capital burn into net new Annual Recurring Revenue (ARR).
         * **[Corporate Finance Institute: Debt-to-Equity Ratio](https://corporatefinanceinstitute.com/resources/commercial-lending/debt-to-equity-ratio/)** — Measures financial leverage and long-term solvency risk.
-        * **[Sifted: Net Revenue Retention (NRR)](https://sifted.eu/)** — Analyzes customer expansion and product stickiness over time.
-        """)
-
-else:
-  st.info(
-      "👈 Configure your target company or startup in the sidebar and click"
-      " **Run Comprehensive Audit** to begin."
-  )
+        * **[Sifted: Net Revenue Retention (NRR)](
