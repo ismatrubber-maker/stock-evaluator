@@ -1,1 +1,12 @@
+# Optional. Gives the app a teal accent colour (otherwise Streamlit's default red is used for buttons and sliders),
+# a clean toolbar, and turns off Streamlit's usage statistics. The app works without this file.
+[theme]
+primaryColor = "#0F766E"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
 
